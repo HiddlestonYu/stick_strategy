@@ -275,6 +275,14 @@ if df is not None and len(df) > max_kbars:
 # ============================================================
 if df is not None:
     # ------------------------------------------------------------
+    # 5.0 建立連續的 x 軸索引（移除所有空白間隙）
+    # ------------------------------------------------------------
+    # 將時間索引轉換為字串格式，用於顯示
+    date_labels = df.index.strftime('%Y-%m-%d %H:%M') if len(df) > 0 and hasattr(df.index[0], 'strftime') else df.index.astype(str)
+    # 建立連續的數字索引（0, 1, 2, 3...）確保沒有任何空白
+    x_range = list(range(len(df)))
+    
+    # ------------------------------------------------------------
     # 5.1 建立雙軸圖表 (K線 + 成交量)
     # ------------------------------------------------------------
     # 使用 Plotly 的 make_subplots 建立包含 2 個子圖的圖表
@@ -296,14 +304,16 @@ if df is not None:
     # 使用 Candlestick 圖表類型繪製 K 線
     # 符合台灣習慣：紅漲（increasing）、綠跌（decreasing）
     candlestick = go.Candlestick(
-        x=df.index,           # x 軸：時間
+        x=x_range,            # 使用連續數字索引代替日期
         open=df['Open'],      # 開盤價
         high=df['High'],      # 最高價
         low=df['Low'],        # 最低價
         close=df['Close'],    # 收盤價
         name='K棒',
         increasing_line_color='red',   # 上漲顯示紅色
-        decreasing_line_color='green'  # 下跌顯示綠色
+        decreasing_line_color='green', # 下跌顯示綠色
+        text=date_labels,     # 將日期作為文字資訊
+        hovertext=date_labels # 懸停時顯示日期
     )
     # 將 K 棒加入第一個子圖（row=1）
     fig.add_trace(candlestick, row=1, col=1)
@@ -314,10 +324,12 @@ if df is not None:
     # 繪製 10 日移動平均線（橘色）
     fig.add_trace(
         go.Scatter(
-            x=df.index, 
+            x=x_range,  # 使用連續數字索引
             y=df['MA10'], 
             line=dict(color='orange', width=1.5), 
-            name='10 MA'
+            name='10 MA',
+            text=date_labels,
+            hovertext=date_labels
         ), 
         row=1, col=1
     )
@@ -325,10 +337,12 @@ if df is not None:
     # 繪製 20 日移動平均線（紫色）
     fig.add_trace(
         go.Scatter(
-            x=df.index, 
+            x=x_range,  # 使用連續數字索引
             y=df['MA20'], 
             line=dict(color='purple', width=1.5), 
-            name='20 MA'
+            name='20 MA',
+            text=date_labels,
+            hovertext=date_labels
         ), 
         row=1, col=1
     )
@@ -344,10 +358,12 @@ if df is not None:
     # 建立柱狀圖並加入第二個子圖（row=2）
     fig.add_trace(
         go.Bar(
-            x=df.index, 
+            x=x_range,  # 使用連續數字索引
             y=df['Volume'], 
             marker_color=colors, 
-            name='成交量'
+            name='成交量',
+            text=date_labels,
+            hovertext=date_labels
         ), 
         row=2, col=1
     )
@@ -364,6 +380,21 @@ if df is not None:
         font=dict(color='white'),         # 字體顏色（白色）
         title_text=f"{product_option} - {session_option} - {interval_option} K線圖",
         hovermode='x unified'             # 滑鼠懸停時顯示十字線和統一提示
+    )
+    
+    # ------------------------------------------------------------
+    # 5.5.1 設定 x 軸顯示實際日期（每隔一段顯示）
+    # ------------------------------------------------------------
+    # 計算要顯示的刻度位置（避免過於密集）
+    tick_spacing = max(1, len(df) // 10)  # 大約顯示 10 個刻度
+    tickvals = list(range(0, len(df), tick_spacing))
+    ticktext = [date_labels[i] for i in tickvals]
+    
+    # 更新 x 軸設定
+    fig.update_xaxes(
+        tickvals=tickvals,
+        ticktext=ticktext,
+        tickangle=-45  # 斜向顯示以避免重疊
     )
     
     # ------------------------------------------------------------
