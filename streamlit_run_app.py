@@ -30,17 +30,19 @@ st.title("📈 台指期全盤 K線圖 (含 10MA/20MA)")
 @st.cache_resource
 def init_shioaji():
     """
-    初始化並登入 Shioaji API
+    初始化 Shioaji API
     使用 cache_resource 確保只初始化一次
+    
+    新版登入方式：使用 API Key 和 Secret
+    在永豐證券網站申請 API Key：https://www.sinotrade.com.tw/
     """
     try:
         api = sj.Shioaji()
-        # 這裡需要替換成您的永豐證券帳號
-        # api.login(person_id="您的身分證字號", passwd="您的密碼")
-        # 目前使用模擬登入
+        # 新版使用 API Key 登入
+        # api.login(api_key="您的API Key", secret_key="您的Secret Key")
         return api
     except Exception as e:
-        st.error(f"Shioaji 連線失敗: {e}")
+        st.error(f"Shioaji 初始化失敗: {e}")
         return None
 
 # 嘗試初始化 Shioaji
@@ -59,17 +61,21 @@ with st.sidebar:
     with st.expander("⚙️ Shioaji 帳號設定（選填）"):
         use_shioaji = st.checkbox("使用 Shioaji 即時數據", value=False)
         if use_shioaji:
-            person_id = st.text_input("身分證字號", type="password")
-            passwd = st.text_input("永豐證券密碼", type="password")
+            st.info("💡 請至永豐證券網站申請 API Key: https://www.sinotrade.com.tw/")
+            api_key = st.text_input("API Key", type="password", help="永豐證券提供的 API Key")
+            secret_key = st.text_input("Secret Key", type="password", help="永豐證券提供的 Secret Key")
             if st.button("登入 Shioaji"):
-                if person_id and passwd:
+                if api_key and secret_key:
                     try:
-                        api.login(person_id=person_id, passwd=passwd)
+                        # 使用新版 API Key 登入
+                        api.login(api_key=api_key, secret_key=secret_key)
                         st.success("✅ Shioaji 登入成功！")
+                        st.session_state['shioaji_logged_in'] = True
                     except Exception as e:
                         st.error(f"❌ 登入失敗: {e}")
+                        st.session_state['shioaji_logged_in'] = False
                 else:
-                    st.warning("請輸入帳號密碼")
+                    st.warning("請輸入 API Key 和 Secret Key")
         else:
             st.info("目前使用 Yahoo Finance 歷史數據")
     
