@@ -38,12 +38,40 @@ def init_shioaji():
     """
     try:
         api = sj.Shioaji()
-        # 新版使用 API Key 登入
-        # api.login(api_key="您的API Key", secret_key="您的Secret Key")
         return api
     except Exception as e:
         st.error(f"Shioaji 初始化失敗: {e}")
         return None
+
+def login_shioaji(api_key=None, secret_key=None, cert_path=None, cert_password=None):
+    """
+    登入 Shioaji（每次使用新的實例）
+    支援兩種登入方式：
+    1. API Key + Secret Key
+    2. 憑證檔案 (.pfx) + 密碼
+    """
+    try:
+        # 建立新的 API 實例以避免快取問題
+        api = sj.Shioaji()
+        
+        # 根據提供的參數決定登入方式
+        if cert_path:
+            # 使用憑證檔案登入
+            result = api.login(
+                person_id=api_key,  # 使用 person_id 而非 api_key
+                passwd=cert_password,
+                contracts_cb=lambda security_type: print(f"{repr(security_type)} fetch done.")
+            )
+        else:
+            # 使用 API Key 登入
+            result = api.login(
+                api_key=api_key, 
+                secret_key=secret_key,
+                contracts_cb=lambda security_type: print(f"{repr(security_type)} fetch done.")
+            )
+        return api, None
+    except Exception as e:
+        return None, str(e)
 
 # 嘗試初始化 Shioaji
 api = init_shioaji()
@@ -61,23 +89,79 @@ with st.sidebar:
     with st.expander("⚙️ Shioaji 帳號設定（選填）"):
         use_shioaji = st.checkbox("使用 Shioaji 即時數據", value=False)
         if use_shioaji:
-            st.info("💡 請至永豐證券網站申請 API Key: https://www.sinotrade.com.tw/")
-            api_key = st.text_input("API Key", type="password", help="永豐證券提供的 API Key")
-            secret_key = st.text_input("Secret Key", type="password", help="永豐證券提供的 Secret Key")
+            # 登入方式選擇
+            login_method = st.radio(
+                "登入方式",
+                ["API Key", "憑證檔案 (.pfx)"],
+                index=1  # 預設使用憑證檔案
+            )
+            
+            if login_method == "憑證檔案 (.pfx)":
+                st.info("💡 已偵測到 Sinopac.pfx 憑證檔案")
+                person_id = st.text_input("身分證字號", help="您的身分證字號")
+                cert_password = st.text_input("憑證密碼", type="password", help="憑證檔案的密碼")
+                use_cert = True
+            else:
+                st.info("💡 請至永豐證券網站申請 API Key: https://www.sinotrade.com.tw/")
+                api_key = st.text_input("API Key", type="password", help="永豐證券提供的 API Key")
+                secret_key = st.text_input("Secret Key", type="password", help="永豐證券提供的 Secret Key")
+                use_cert = False
+            
+            # 顯示登入狀態
+            if 'shioaji_logged_in' in st.session_state and st.session_state.get('shioaji_logged_in'):
+                st.success("✅ 已登入 Shioaji")
+                if st.button("登出"):
+                    st.session_state['shioaji_logged_in'] = False
+                    st.session_state.pop('shioaji_api', None)
+                    st.rerun()
+            
             if st.button("登入 Shioaji"):
-                if api_key and secret_key:
-                    try:
-                        # 使用新版 API Key 登入
-                        api.login(api_key=api_key, secret_key=secret_key)
-                        st.success("✅ Shioaji 登入成功！")
-                        st.session_state['shioaji_logged_in'] = True
-                    except Exception as e:
-                        st.error(f"❌ 登入失敗: {e}")
-                        st.session_state['shioaji_logged_in'] = False
+                # 檢查必要欄位
+                if use_cert:
+                    if not person_id or not cert_password:
+                        st.warning("請輸入身分證字號和憑證密碼")
+                    else:
+                        with st.spinner("🔄 使用憑證檔案登入中，請稍候..."):
+                            try:
+                                cert_path = "d:\\Hiddleston\\stick_strategy\\Sinopac.pfx"
+                                new_api, error = login_shioaji(
+                                    api_key=person_id,
+                                    cert_password=cert_password,
+                                    cert_path=cert_path
+                                )
+                                if new_api:
+                                    st.success("✅ Shioaji 憑證登入成功！")
+                                    st.session_state['shioaji_logged_in'] = True
+                                    st.session_state['shioaji_api'] = new_api
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ 登入失敗: {error[:200] if error else '未知錯誤'}")
+                                    st.session_state['shioaji_logged_in'] = False
+                            except Exception as e:
+                                st.error(f"❌ 登入失敗: {str(e)[:200]}")
+                                st.session_state['shioaji_logged_in'] = False
                 else:
-                    st.warning("請輸入 API Key 和 Secret Key")
+                    if not api_key or not secret_key:
+                        st.warning("請輸入 API Key 和 Secret Key")
+                    else:
+                        with st.spinner("🔄 登入中，請稍候..."):
+                            try:
+                                new_api, error = login_shioaji(api_key, secret_key)
+                                if new_api:
+                                    st.success("✅ Shioaji 登入成功！")
+                                    st.session_state['shioaji_logged_in'] = True
+                                    st.session_state['shioaji_api'] = new_api
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ 登入失敗: {error[:200] if error else '未知錯誤'}")
+                                    st.session_state['shioaji_logged_in'] = False
+                            except Exception as e:
+                                st.error(f"❌ 登入失敗: {str(e)[:200]}")
+                                st.session_state['shioaji_logged_in'] = False
         else:
             st.info("目前使用 Yahoo Finance 歷史數據")
+            if 'shioaji_logged_in' in st.session_state:
+                st.session_state['shioaji_logged_in'] = False
     
     # ------------------------------------------------------------
     # 2.1 商品選擇下拉選單
@@ -371,7 +455,7 @@ def process_kline_data(df, interval, session):
     return df
 
 # 主要數據獲取函數
-def get_data(interval, product, session, use_shioaji=False):
+def get_data(interval, product, session, use_shioaji=False, api_instance=None):
     """
     統一的數據獲取接口
     
@@ -380,10 +464,11 @@ def get_data(interval, product, session, use_shioaji=False):
         product (str): 商品名稱
         session (str): 交易時段
         use_shioaji (bool): 是否使用 Shioaji API
+        api_instance: Shioaji API 實例（如果使用 Shioaji）
     """
-    if use_shioaji and api is not None:
+    if use_shioaji and api_instance is not None:
         # 使用 Shioaji
-        df = get_data_from_shioaji(api, interval, product, session)
+        df = get_data_from_shioaji(api_instance, interval, product, session)
     else:
         # 使用 Yahoo Finance
         df = get_data_from_yahoo(interval, product, session)
@@ -398,11 +483,16 @@ def get_data(interval, product, session, use_shioaji=False):
 # ============================================================
 # 呼叫 get_data 函數獲取 K 線數據（根據側邊欄設定決定使用哪個資料源）
 try:
-    use_shioaji_flag = use_shioaji if 'use_shioaji' in locals() else False
+    use_shioaji_flag = st.session_state.get('shioaji_logged_in', False) and 'shioaji_api' in st.session_state
 except:
     use_shioaji_flag = False
 
-df = get_data(interval_option, product_option, session_option, use_shioaji_flag)
+# 取得資料時傳遞 API 實例
+if use_shioaji_flag:
+    api_instance = st.session_state['shioaji_api']
+    df = get_data(interval_option, product_option, session_option, use_shioaji_flag, api_instance)
+else:
+    df = get_data(interval_option, product_option, session_option, use_shioaji_flag)
 
 # 根據使用者設定的最大K棒數限制資料量
 # 使用 tail() 取後面的 N 筆資料，保留最新的 K 棒
