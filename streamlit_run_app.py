@@ -6,18 +6,19 @@
 並包含移動平均線（MA10/MA20）技術指標
 
 作者: AI Assistant
-版本: 2.0
-日期: 2026-01-13
+版本: 3.0 - 使用 Shioaji API
+日期: 2026-01-14
 """
 
 import streamlit as st  # Streamlit Web 框架，用於建立互動式網頁應用
 import plotly.graph_objects as go  # Plotly 圖表物件，用於繪製互動式圖表
 from plotly.subplots import make_subplots  # Plotly 子圖功能，用於建立多軸圖表
-import yfinance as yf  # Yahoo Finance API，用於下載股票歷史數據
 import pandas as pd  # Pandas 數據處理庫，用於資料分析和處理
+import shioaji as sj  # Shioaji API，用於獲取台灣期貨和股票即時數據
+from datetime import datetime, timedelta  # 日期時間處理
 
 # ============================================================
-# 1. 頁面初始化設定
+# 1. 頁面初始化設定與 Shioaji 連線
 # ============================================================
 # 設定頁面配置：使用寬版面並自訂標題
 st.set_page_config(layout="wide", page_title="台指期程式交易看盤室")
@@ -25,12 +26,52 @@ st.set_page_config(layout="wide", page_title="台指期程式交易看盤室")
 # 顯示主標題
 st.title("📈 台指期全盤 K線圖 (含 10MA/20MA)")
 
+# 初始化 Shioaji API
+@st.cache_resource
+def init_shioaji():
+    """
+    初始化並登入 Shioaji API
+    使用 cache_resource 確保只初始化一次
+    """
+    try:
+        api = sj.Shioaji()
+        # 這裡需要替換成您的永豐證券帳號
+        # api.login(person_id="您的身分證字號", passwd="您的密碼")
+        # 目前使用模擬登入
+        return api
+    except Exception as e:
+        st.error(f"Shioaji 連線失敗: {e}")
+        return None
+
+# 嘗試初始化 Shioaji
+api = init_shioaji()
+
 # ============================================================
 # 2. 側邊欄控制項
 # ============================================================
 # 使用 Streamlit 的 sidebar 功能建立參數控制面板
 with st.sidebar:
     st.header("參數設定")
+    
+    # ------------------------------------------------------------
+    # 2.0 Shioaji 帳號設定
+    # ------------------------------------------------------------
+    with st.expander("⚙️ Shioaji 帳號設定（選填）"):
+        use_shioaji = st.checkbox("使用 Shioaji 即時數據", value=False)
+        if use_shioaji:
+            person_id = st.text_input("身分證字號", type="password")
+            passwd = st.text_input("永豐證券密碼", type="password")
+            if st.button("登入 Shioaji"):
+                if person_id and passwd:
+                    try:
+                        api.login(person_id=person_id, passwd=passwd)
+                        st.success("✅ Shioaji 登入成功！")
+                    except Exception as e:
+                        st.error(f"❌ 登入失敗: {e}")
+                else:
+                    st.warning("請輸入帳號密碼")
+        else:
+            st.info("目前使用 Yahoo Finance 歷史數據")
     
     # ------------------------------------------------------------
     # 2.1 商品選擇下拉選單
@@ -88,28 +129,51 @@ with st.sidebar:
 # 3. 數據獲取與處理 (Data Handler)
 # ============================================================
 
+def get_contract(api, product):
+    """
+    根據商品選擇返回對應的 Shioaji 合約
+    
+    參數:
+        api: Shioaji API 實例
+        product (str): 使用者選擇的商品名稱
+        
+    返回:
+        contract: Shioaji 合約物件，若失敗則返回 None
+    """
+    try:
+        if product == "台指期 (模擬)":
+            # 獲取最近月份的台指期合約
+            contracts = api.Contracts.Futures.TXF
+            # 返回最近月份合約（通常是第一個）
+            return contracts[list(contracts.keys())[0]] if contracts else None
+        elif product == "台積電 (2330.TW)":
+            # 台積電股票
+            return api.Contracts.Stocks["2330"]
+        elif product == "台灣加權指數 (^TWII)":
+            # 加權指數使用台指期模擬
+            contracts = api.Contracts.Futures.TXF
+            return contracts[list(contracts.keys())[0]] if contracts else None
+    except Exception as e:
+        st.error(f"獲取合約失敗: {e}")
+        return None
+
 def get_ticker_symbol(product):
     """
-    根據使用者選擇的商品返回對應的 Yahoo Finance 股票代碼
+    根據使用者選擇的商品返回對應的 Yahoo Finance 股票代碼（備用）
     
     參數:
         product (str): 使用者選擇的商品名稱
         
     返回:
         str: Yahoo Finance 的股票代碼
-        
-    說明:
-        - 台指期使用加權指數(^TWII)模擬
-        - 台積電代碼為 2330.TW
-        - 加權指數代碼為 ^TWII
     """
     if product == "台指期 (模擬)":
-        return "^TWII"  # 使用台灣加權指數模擬台指期
+        return "^TWII"
     elif product == "台積電 (2330.TW)":
         return "2330.TW"
     elif product == "台灣加權指數 (^TWII)":
         return "^TWII"
-    return "^TWII"  # 預設返回加權指數
+    return "^TWII"
 
 def filter_by_session(df, session):
     """
@@ -157,113 +221,182 @@ def filter_by_session(df, session):
         return df
 
 @st.cache_data(ttl=60)  # 使用 Streamlit 快取機制，60 秒內避免重複請求相同資料
-def get_data(interval, product, session):
+def get_data_from_shioaji(_api, interval, product, session):
     """
-    從 Yahoo Finance 下載並處理股票 K 線數據
+    從 Shioaji API 獲取 K 線數據
     
     參數:
-        interval (str): K 線週期 - "1m", "5m", "15m", "30m", "60m", "1d"
+        _api: Shioaji API 實例（前綴 _ 避免被快取）
+        interval (str): K 線週期
         product (str): 商品名稱
-        session (str): 交易時段 - "日盤", "夜盤", "全盤"
+        session (str): 交易時段
         
     返回:
-        pd.DataFrame: 包含 OHLCV 和技術指標的 DataFrame，若失敗則返回 None
-        
-    資料欄位:
-        - Open: 開盤價
-        - High: 最高價
-        - Low: 最低價
-        - Close: 收盤價
-        - Volume: 成交量
-        - MA10: 10 日移動平均線
-        - MA20: 20 日移動平均線
-        
-    注意:
-        實戰環境建議使用 Shioaji API: api.kline(contract, min_volume=1)
+        pd.DataFrame: K 線數據
     """
-    # 取得對應的股票代碼
+    try:
+        # 獲取合約
+        contract = get_contract(_api, product)
+        if contract is None:
+            return None
+        
+        # 設定時間範圍
+        end_date = datetime.now()
+        if interval == "1d":
+            start_date = end_date - timedelta(days=730)  # 2年
+        elif interval in ["30m", "60m"]:
+            start_date = end_date - timedelta(days=60)
+        elif interval == "15m":
+            start_date = end_date - timedelta(days=30)
+        else:
+            start_date = end_date - timedelta(days=7)
+        
+        # 轉換 interval 格式給 Shioaji
+        # Shioaji 使用分鐘數，例如: 1, 5, 15, 30, 60, 1440(日)
+        interval_map = {
+            "1m": 1,
+            "5m": 5,
+            "15m": 15,
+            "30m": 30,
+            "60m": 60,
+            "1d": 1440
+        }
+        kbar_interval = interval_map.get(interval, 5)
+        
+        # 獲取 K 線數據
+        kbars = _api.kbars(
+            contract=contract,
+            start=start_date.strftime("%Y-%m-%d"),
+            end=end_date.strftime("%Y-%m-%d")
+        )
+        
+        # 轉換為 DataFrame
+        if kbars and len(kbars) > 0:
+            df = pd.DataFrame({**kbars})
+            df['ts'] = pd.to_datetime(df['ts'])
+            df = df.set_index('ts')
+            
+            # 標準化欄位名稱
+            df = df.rename(columns={
+                'Open': 'Open',
+                'High': 'High',
+                'Low': 'Low',
+                'Close': 'Close',
+                'Volume': 'Volume'
+            })
+            
+            return df
+        else:
+            return None
+            
+    except Exception as e:
+        st.error(f"Shioaji 數據獲取失敗: {e}")
+        return None
+
+@st.cache_data(ttl=60)
+def get_data_from_yahoo(interval, product, session):
+    """
+    從 Yahoo Finance 下載 K 線數據（備用方案）
+    """
+    import yfinance as yf
+    
     ticker = get_ticker_symbol(product)
     
-    # ------------------------------------------------------------
-    # 根據 K 線週期調整下載期間
-    # ------------------------------------------------------------
-    # Yahoo Finance 對不同週期有數據量限制，需要合理設定下載期間
     if interval == "1d":
-        period = "2y"  # 日K：下載 2 年資料（約 500 個交易日）
+        period = "2y"
     elif interval in ["30m", "60m"]:
-        period = "60d"  # 30分/60分K：下載 60 天資料
-    elif interval in ["15m"]:
-        period = "30d"  # 15分K：下載 30 天資料
+        period = "60d"
+    elif interval == "15m":
+        period = "30d"
     else:
-        period = "7d"  # 1分/5分K：下載 7 天資料
+        period = "7d"
     
-    # ------------------------------------------------------------
-    # 下載數據並進行錯誤處理
-    # ------------------------------------------------------------
     try:
-        # progress=False 避免顯示下載進度條
         df = yf.download(ticker, period=period, interval=interval, progress=False)
     except Exception as e:
         st.error(f"數據下載失敗: {e}")
         return None
     
-    # 檢查是否成功下載到數據
     if df.empty:
         return None
     
-    # ------------------------------------------------------------
-    # 資料清理與標準化
-    # ------------------------------------------------------------
-    # 處理多層索引的欄位名稱（當下載多個股票時會出現）
+    # 資料清理
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    
-    # 標準化欄位名稱：確保首字母大寫（Open, High, Low, Close, Volume）
     df.columns = [col.capitalize() for col in df.columns]
+    
+    return df
+
+def process_kline_data(df, interval, session):
+    """
+    處理並計算技術指標的通用函數
+    """
+    if df is None or df.empty:
+        return None
     
     # ------------------------------------------------------------
     # 時區轉換
     # ------------------------------------------------------------
-    # 將時間索引轉換為台灣時間（Asia/Taipei）
     try:
-        # 如果已有時區資訊，直接轉換
         df.index = df.index.tz_convert('Asia/Taipei')
-    except TypeError:
-        # 如果沒有時區資訊，先設定為 UTC 再轉換為台灣時間
-        df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
+    except (TypeError, AttributeError):
+        try:
+            df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
+        except:
+            df.index = df.index.tz_localize('Asia/Taipei')
     
     # ------------------------------------------------------------
     # 過濾非交易時間
     # ------------------------------------------------------------
-    # 日K 線移除週末（週六=5, 週日=6）
     if interval == "1d":
         df = df[df.index.dayofweek < 5]
     
-    # 根據使用者選擇的時段過濾數據（日盤/夜盤/全盤）
     df = filter_by_session(df, session)
     
-    # 再次檢查過濾後是否還有數據
     if df.empty:
         return None
     
     # ------------------------------------------------------------
     # 計算技術指標
     # ------------------------------------------------------------
-    # 計算 10 日移動平均線（MA10）
-    # rolling(window=10) 建立 10 個數據點的滾動視窗
-    # mean() 計算視窗內的平均值
     df['MA10'] = df['Close'].rolling(window=10).mean()
-    
-    # 計算 20 日移動平均線（MA20）
     df['MA20'] = df['Close'].rolling(window=20).mean()
     
     return df
 
+# 主要數據獲取函數
+def get_data(interval, product, session, use_shioaji=False):
+    """
+    統一的數據獲取接口
+    
+    參數:
+        interval (str): K 線週期
+        product (str): 商品名稱
+        session (str): 交易時段
+        use_shioaji (bool): 是否使用 Shioaji API
+    """
+    if use_shioaji and api is not None:
+        # 使用 Shioaji
+        df = get_data_from_shioaji(api, interval, product, session)
+    else:
+        # 使用 Yahoo Finance
+        df = get_data_from_yahoo(interval, product, session)
+    
+    # 處理數據並計算技術指標
+    return process_kline_data(df, interval, session)
+
 # ============================================================
 # 4. 主程式執行：獲取數據並限制K棒數量
 # ============================================================
-# 呼叫 get_data 函數獲取 K 線數據
-df = get_data(interval_option, product_option, session_option)
+# 4. 主程式執行：獲取數據並限制K棒數量
+# ============================================================
+# 呼叫 get_data 函數獲取 K 線數據（根據側邊欄設定決定使用哪個資料源）
+try:
+    use_shioaji_flag = use_shioaji if 'use_shioaji' in locals() else False
+except:
+    use_shioaji_flag = False
+
+df = get_data(interval_option, product_option, session_option, use_shioaji_flag)
 
 # 根據使用者設定的最大K棒數限制資料量
 # 使用 tail() 取後面的 N 筆資料，保留最新的 K 棒
