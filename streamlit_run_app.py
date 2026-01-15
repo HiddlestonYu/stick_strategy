@@ -86,14 +86,14 @@ with st.sidebar:
     # ------------------------------------------------------------
     # 2.0 Shioaji 帳號設定
     # ------------------------------------------------------------
-    with st.expander("⚙️ Shioaji 帳號設定（選填）"):
-        use_shioaji = st.checkbox("使用 Shioaji 即時數據", value=False)
+    with st.expander("⚙️ Shioaji 帳號設定（選填）", expanded=True):
+        use_shioaji = st.checkbox("使用 Shioaji 即時數據", value=True)
         if use_shioaji:
             # 登入方式選擇
             login_method = st.radio(
                 "登入方式",
                 ["API Key", "憑證檔案 (.pfx)"],
-                index=1  # 預設使用憑證檔案
+                index=0  # 預設使用 API Key
             )
             
             if login_method == "憑證檔案 (.pfx)":
@@ -103,8 +103,8 @@ with st.sidebar:
                 use_cert = True
             else:
                 st.info("💡 請至永豐證券網站申請 API Key: https://www.sinotrade.com.tw/")
-                api_key = st.text_input("API Key", type="password", help="永豐證券提供的 API Key")
-                secret_key = st.text_input("Secret Key", type="password", help="永豐證券提供的 Secret Key")
+                api_key = st.text_input("API Key", type="password", value="F97Uvg5MtkHWLzPzueMkxYYgZwo8h18Qsk6Y3Ah6BBox", help="永豐證券提供的 API Key")
+                secret_key = st.text_input("Secret Key", type="password", value="5a1Uenx7KtJN1CxxHC34MDJgHN67ePysroAPGmzTv1zG", help="永豐證券提供的 Secret Key")
                 use_cert = False
             
             # 顯示登入狀態
@@ -310,7 +310,7 @@ def filter_by_session(df, session):
         # 返回所有資料不過濾
         return df
 
-@st.cache_data(ttl=60)  # 使用 Streamlit 快取機制，60 秒內避免重複請求相同資料
+@st.cache_data(ttl=10)  # 使用 Streamlit 快取機制，10 秒內避免重複請求相同資料（即時更新）
 def get_data_from_shioaji(_api, interval, product, session):
     """
     從 Shioaji API 獲取 K 線數據
@@ -330,16 +330,18 @@ def get_data_from_shioaji(_api, interval, product, session):
         if contract is None:
             return None
         
-        # 設定時間範圍
+        # 設定時間範圍（根據週期調整，避免抓取過多數據）
         end_date = datetime.now()
         if interval == "1d":
-            start_date = end_date - timedelta(days=730)  # 2年
+            start_date = end_date - timedelta(days=200)  # 日線約 200 天（約半年交易日）
         elif interval in ["30m", "60m"]:
-            start_date = end_date - timedelta(days=60)
+            start_date = end_date - timedelta(days=30)   # 30分/60分線 30 天
         elif interval == "15m":
-            start_date = end_date - timedelta(days=30)
+            start_date = end_date - timedelta(days=15)   # 15分線 15 天
+        elif interval == "5m":
+            start_date = end_date - timedelta(days=7)    # 5分線 7 天
         else:
-            start_date = end_date - timedelta(days=7)
+            start_date = end_date - timedelta(days=3)    # 1分線 3 天
         
         # 轉換 interval 格式給 Shioaji
         # Shioaji 使用分鐘數，例如: 1, 5, 15, 30, 60, 1440(日)
@@ -354,6 +356,7 @@ def get_data_from_shioaji(_api, interval, product, session):
         kbar_interval = interval_map.get(interval, 5)
         
         # 獲取 K 線數據
+        # Shioaji kbars 方法只接受 contract, start, end 參數
         kbars = _api.kbars(
             contract=contract,
             start=start_date.strftime("%Y-%m-%d"),
@@ -361,21 +364,33 @@ def get_data_from_shioaji(_api, interval, product, session):
         )
         
         # 轉換為 DataFrame
-        if kbars and len(kbars) > 0:
-            df = pd.DataFrame({**kbars})
-            df['ts'] = pd.to_datetime(df['ts'])
-            df = df.set_index('ts')
-            
-            # 標準化欄位名稱
-            df = df.rename(columns={
-                'Open': 'Open',
-                'High': 'High',
-                'Low': 'Low',
-                'Close': 'Close',
-                'Volume': 'Volume'
-            })
-            
-            return df
+        # Shioaji 的 kbars 返回 Kbars 物件，需要轉換為 DataFrame
+        if kbars is not None:
+            try:
+                # 將 Kbars 物件轉換為 DataFrame
+                df = pd.DataFrame({**kbars})
+                
+                if df.empty:
+                    return None
+                
+                # 設定時間索引
+                df['ts'] = pd.to_datetime(df['ts'])
+                df = df.set_index('ts')
+                
+                # 標準化欄位名稱（Shioaji 使用小寫）
+                if 'open' in df.columns:
+                    df = df.rename(columns={
+                        'open': 'Open',
+                        'high': 'High',
+                        'low': 'Low',
+                        'close': 'Close',
+                        'volume': 'Volume'
+                    })
+                
+                return df
+            except Exception as e:
+                st.error(f"資料轉換失敗: {e}")
+                return None
         else:
             return None
             
@@ -524,7 +539,7 @@ if df is not None:
         shared_xaxes=True, 
         vertical_spacing=0.03, 
         subplot_titles=('K 線與均線', '成交量'),
-        row_width=[0.2, 0.7]  # K線圖佔 70%，成交量圖佔 20%
+        row_width=[0.15, 0.85]  # K線圖佔 85%，成交量圖佔 15%
     )
 
     # ------------------------------------------------------------
@@ -541,6 +556,8 @@ if df is not None:
         name='K棒',
         increasing_line_color='red',   # 上漲顯示紅色
         decreasing_line_color='green', # 下跌顯示綠色
+        increasing_line_width=2,       # 增加 K 棒線條寬度
+        decreasing_line_width=2,       # 增加 K 棒線條寬度
         text=date_labels,     # 將日期作為文字資訊
         hovertext=date_labels # 懸停時顯示日期
     )
@@ -603,7 +620,7 @@ if df is not None:
     # 模擬專業看盤軟體的深色風格
     fig.update_layout(
         xaxis_rangeslider_visible=False,  # 隱藏下方滑動條以節省空間
-        height=700,                       # 圖表高度 700 像素
+        height=900,                       # 圖表高度 900 像素（加大顯示）
         plot_bgcolor='rgb(20, 20, 20)',  # 繪圖區背景色（深灰色）
         paper_bgcolor='rgb(20, 20, 20)', # 整個畫布背景色
         font=dict(color='white'),         # 字體顏色（白色）
@@ -646,6 +663,12 @@ if df is not None:
     col2.metric("10 MA", f"{last_row['MA10']:.0f}")           # 10日均線
     col3.metric("20 MA", f"{last_row['MA20']:.0f}")           # 20日均線
     col4.metric("成交量", f"{last_row['Volume']:.0f}")        # 成交量
+    
+    # 顯示自動更新提示
+    if use_shioaji_flag:
+        st.info("📊 使用 Shioaji 即時數據，每 10 秒自動更新")
+    else:
+        st.info("📊 使用 Yahoo Finance 歷史數據")
 
 else:
     # ------------------------------------------------------------
