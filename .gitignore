@@ -43,3 +43,6 @@ test_*.py
 *.csv
 *.xlsx
 *.json
+
+# Skills (測試用)
+.github/skills/
