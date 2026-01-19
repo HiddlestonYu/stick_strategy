@@ -17,6 +17,7 @@ import pandas as pd  # Pandas 數據處理庫，用於資料分析和處理
 import shioaji as sj  # Shioaji API，用於獲取台灣期貨和股票即時數據
 from datetime import datetime, timedelta  # 日期時間處理
 import pytz  # 時區處理庫，用於處理不同時區的時間
+import time  # 時間處理，用於自動刷新
 
 # ============================================================
 # 1. 頁面初始化設定與 Shioaji 連線
@@ -219,15 +220,28 @@ with st.sidebar:
             # 顯示登入狀態
             if 'shioaji_logged_in' in st.session_state and st.session_state.get('shioaji_logged_in'):
                 st.success("✅ 已登入 Shioaji")
-                if st.button("登出"):
-                    # 關閉舊的連線
-                    if 'shioaji_api' in st.session_state and st.session_state['shioaji_api']:
-                        try:
-                            st.session_state['shioaji_api'].logout()
-                        except:
-                            pass
+                
+                col_logout1, col_logout2 = st.columns(2)
+                
+                if col_logout1.button("🔓 登出", use_container_width=True):
+                    with st.spinner("正在登出..."):
+                        # 關閉舊的連線
+                        if 'shioaji_api' in st.session_state and st.session_state['shioaji_api']:
+                            try:
+                                st.session_state['shioaji_api'].logout()
+                                st.success("✅ 已成功登出")
+                            except Exception as e:
+                                st.warning(f"⚠️ 登出時發生錯誤: {str(e)}")
+                        st.session_state['shioaji_logged_in'] = False
+                        st.session_state.pop('shioaji_api', None)
+                        time.sleep(1)  # 等待1秒確保連線完全關閉
+                        st.rerun()
+                
+                if col_logout2.button("🔄 強制重置", use_container_width=True):
+                    # 強制清除所有連線狀態
                     st.session_state['shioaji_logged_in'] = False
                     st.session_state.pop('shioaji_api', None)
+                    st.warning("⚠️ 已強制清除連線狀態，請等待1-2分鐘後重新登入")
                     st.rerun()
             
             if st.button("登入 Shioaji"):
@@ -238,14 +252,17 @@ with st.sidebar:
                     else:
                         with st.spinner("🔄 使用憑證檔案登入中，請稍候..."):
                             try:
-                                # 先關閉舊的連線
+                                # 先關閉舊的連線並等待
                                 if 'shioaji_api' in st.session_state and st.session_state['shioaji_api']:
                                     try:
+                                        st.caption("🔄 正在關閉舊連線...")
                                         st.session_state['shioaji_api'].logout()
+                                        time.sleep(2)  # 等待2秒確保舊連線完全關閉
                                     except:
                                         pass
                                     st.session_state.pop('shioaji_api', None)
                                 
+                                st.caption("🔄 正在建立新連線...")
                                 cert_path = "d:\\Hiddleston\\stick_strategy\\Sinopac.pfx"
                                 new_api, error = login_shioaji(
                                     api_key=person_id,
@@ -261,7 +278,11 @@ with st.sidebar:
                                     st.rerun()
                                 else:
                                     st.error(f"❌ 登入失敗: {error if error else '未知錯誤'}")
-                                    st.warning("💡 提示: 如果出現連線數過多，請稍等1-2分鐘或聯繫永豐證券客服")
+                                    if error and ('連線數過多' in str(error) or 'Too Many Connections' in str(error)):
+                                        st.warning("⚠️ 連線數過多的解決方式：")
+                                        st.info("1️⃣ 點擊「🔄 強制重置」按鈕清除連線\n2️⃣ 等待 1-2 分鐘讓舊連線逾時\n3️⃣ 確認沒有其他程式或瀏覽器分頁在使用 Shioaji\n4️⃣ 聯繫永豐證券客服重置連線")
+                                    else:
+                                        st.warning("💡 提示: 如果出現連線數過多，請稍等1-2分鐘或聯繫永豐證券客服")
                                     st.session_state['shioaji_logged_in'] = False
                             except Exception as e:
                                 st.error(f"❌ 登入失敗: {str(e)}")
@@ -311,12 +332,12 @@ with st.sidebar:
     # 3.2 商品選擇下拉選單
     # ------------------------------------------------------------
     # 提供三種商品選項供使用者選擇
-    # index=0 表示預設選擇第一個選項（台指期模擬）
+    # index=0 表示預設選擇第一個選項（台指期）
     product_option = st.selectbox(
         "選擇商品",
-        ("台灣加權指數 (^TWII)", "台積電 (2330.TW)"),
+        ("台指期貨 (TXF)", "台積電 (2330.TW)"),
         index=0,
-        help="⚠️ Shioaji 的期貨合約歷史數據極少（約21筆），建議使用 Yahoo Finance 獲取完整數據"
+        help="📊 台指期貨：使用最近月份期貨合約，支援即時日盤與夜盤數據"
     )
     
     # ------------------------------------------------------------
@@ -358,11 +379,37 @@ with st.sidebar:
     
     st.divider()  # 分隔線
     
+    st.divider()  # 分隔線
+    
+    # ------------------------------------------------------------
+    # 3.6 即時更新設定
+    # ------------------------------------------------------------
+    with st.expander("⚡ 即時更新設定", expanded=True):
+        auto_refresh = st.checkbox(
+            "啟用自動刷新", 
+            value=False,
+            help="啟用後，圖表會自動更新以顯示最新即時數據"
+        )
+        
+        if auto_refresh:
+            refresh_interval = st.slider(
+                "刷新間隔（秒）",
+                min_value=1,
+                max_value=60,
+                value=3,
+                step=1,
+                help="設定圖表自動更新的時間間隔"
+            )
+            st.success(f"✅ 自動刷新已啟用，每 {refresh_interval} 秒更新一次")
+        else:
+            refresh_interval = None
+            st.info("ℹ️ 手動模式：點擊重新載入按鈕以更新數據")
+    
     # 顯示提示訊息
-    st.caption("💡 提示：實戰中建議使用 Shioaji API 接收 Tick 資料並即時合成 K 棒。")
+    st.caption("💡 提示：啟用自動刷新可獲得動態K棒更新效果。")
     
     # 顯示當前設定摘要
-    st.info(f"📊 **當前設定**\n- 商品: {product_option}\n- 時段: {session_option}\n- 週期: {interval_option}\n- K棒數: {max_kbars}")
+    st.info(f"📊 **當前設定**\n- 商品: {product_option}\n- 時段: {session_option}\n- 週期: {interval_option}\n- K棒數: {max_kbars}\n- 自動刷新: {'✅ 啟用' if auto_refresh else '❌ 停用'}")
     
     # 數據量統計區（會在獲取數據後自動更新）
     if 'data_stats' not in st.session_state:
@@ -381,24 +428,32 @@ def get_contract(api, product):
         product (str): 使用者選擇的商品名稱
         
     返回:
-        contract 或 list: Shioaji 合約物件或合約列表，若失敗則返回 None
+        contract: Shioaji 合約物件，若失敗則返回 None
     """
     try:
-        if product == "台灣加權指數 (^TWII)":
-            # 加權指數使用台指期來模擬，返回所有可用合約以便拼接
+        if product == "台指期貨 (TXF)":
+            # 獲取最近月份的台指期合約
             try:
                 contracts = api.Contracts.Futures.TXF
                 if contracts:
-                    contract_list = list(contracts.keys())
-                    st.sidebar.caption(f"📋 可用台指期合約: {len(contract_list)} 個")
+                    # 獲取所有合約代碼並排序（最近月份在前）
+                    contract_list = sorted(list(contracts.keys()))
                     
-                    # 返回所有合約以便拼接歷史數據
-                    all_contracts = [contracts[key] for key in sorted(contract_list)]
-                    st.sidebar.caption(f"✅ 將拼接 {len(all_contracts)} 個合約數據")
+                    # 找出最近的合約（通常是第一個或第二個）
+                    # 優先使用第一個合約（最近月份）
+                    nearest_contract_code = contract_list[0] if contract_list else None
                     
-                    return all_contracts
+                    if nearest_contract_code:
+                        contract = contracts[nearest_contract_code]
+                        st.sidebar.success(f"✅ 使用台指期合約: {contract.code}")
+                        st.sidebar.caption(f"📊 合約到期日: {contract.delivery_date if hasattr(contract, 'delivery_date') else '未知'}")
+                        st.sidebar.caption(f"📋 可用合約: {', '.join(contract_list[:3])}...")
+                        return contract
+                    else:
+                        st.sidebar.error("❌ 無可用台指期合約")
+                        return None
                 else:
-                    st.sidebar.error("❌ 無台指期合約，請確認已下載合約資料")
+                    st.sidebar.error("❌ 無台指期合約，請確認已登入並下載合約資料")
                     return None
             except Exception as e:
                 st.sidebar.error(f"❌ 獲取台指期合約失敗: {str(e)[:100]}")
@@ -426,8 +481,8 @@ def get_ticker_symbol(product):
     返回:
         str: Yahoo Finance 的股票代碼
     """
-    if product == "台灣加權指數 (^TWII)":
-        return "^TWII"
+    if product == "台指期貨 (TXF)":
+        return "^TWII"  # 用加權指數模擬台指期
     elif product == "台積電 (2330.TW)":
         return "2330.TW"
     return "^TWII"
@@ -487,10 +542,10 @@ def filter_by_session(df, session, interval):
         # 返回所有資料不過濾
         return df
 
-@st.cache_data(ttl=60)  # 使用 Streamlit 快取機制，60 秒內避免重複請求相同資料
+@st.cache_data(ttl=3)  # 即時數據快取僅3秒，確保數據即時性
 def get_data_from_shioaji(_api, interval, product, session):
     """
-    從 Shioaji API 獲取 K 線數據，支援多合約拼接
+    從 Shioaji API 獲取 K 線數據（即時更新）
     
     參數:
         _api: Shioaji API 實例（前綴 _ 避免被快取）
@@ -508,209 +563,156 @@ def get_data_from_shioaji(_api, interval, product, session):
             st.warning("⚠️ 無法獲取合約，請確認已登入並下載合約資料")
             return None
         
-        # 設定時間範圍
-        end_date = datetime.now()
-        if interval == "1d":
-            start_date = end_date - timedelta(days=730)  # 2年數據
-        elif interval in ["30m", "60m"]:
-            start_date = end_date - timedelta(days=60)
-        elif interval == "15m":
-            start_date = end_date - timedelta(days=30)
-        else:
-            start_date = end_date - timedelta(days=7)
-        
-        # 檢查是否為多合約（期貨需要拼接）
+        # 檢查是否為多合約（期貨需要拼接）- 現在改為單一合約模式
         if isinstance(contracts, list):
-            st.sidebar.info(f"🔗 正在拼接 {len(contracts)} 個期貨合約數據...")
-            all_dfs = []
-            
-            # 逐個獲取每個合約的數據
-            for i, contract in enumerate(contracts):
-                try:
-                    st.sidebar.caption(f"📥 正在獲取 {contract.code} 數據... ({i+1}/{len(contracts)})")
-                    
-                    kbars = _api.kbars(
-                        contract=contract,
-                        start=start_date.strftime("%Y-%m-%d"),
-                        end=end_date.strftime("%Y-%m-%d")
-                    )
-                    
-                    if kbars is not None:
-                        df = pd.DataFrame({**kbars})
-                        if not df.empty:
-                            df['ts'] = pd.to_datetime(df['ts'])
-                            df = df.set_index('ts')
-                            
-                            # 標準化欄位名稱（檢查欄位是否存在）
-                            rename_map = {}
-                            if 'open' in df.columns:
-                                rename_map['open'] = 'Open'
-                            if 'high' in df.columns:
-                                rename_map['high'] = 'High'
-                            if 'low' in df.columns:
-                                rename_map['low'] = 'Low'
-                            if 'close' in df.columns:
-                                rename_map['close'] = 'Close'
-                            if 'volume' in df.columns:
-                                rename_map['volume'] = 'Volume'
-                            
-                            if rename_map:
-                                df = df.rename(columns=rename_map)
-                            
-                            # 如果沒有 Volume，設為0
-                            if 'Volume' not in df.columns:
-                                df['Volume'] = 0
-                            
-                            # 確保必要欄位存在
-                            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-                            if all(col in df.columns for col in required_cols):
-                                df['contract'] = contract.code  # 標記合約代碼
-                                all_dfs.append(df)
-                                st.sidebar.caption(f"  ✅ {contract.code}: {len(df)} 筆")
-                            else:
-                                missing = [col for col in required_cols if col not in df.columns]
-                                st.sidebar.caption(f"  ⚠️ {contract.code}: 缺少欄位 {missing}")
-                except Exception as e:
-                    st.sidebar.caption(f"  ⚠️ {contract.code}: {str(e)[:50]}")
-                    continue
-            
-            if not all_dfs:
-                st.sidebar.error("❌ 無法獲取任何合約數據")
+            # 歷史多合約拼接模式（已停用，改用單一最近月份合約）
+            st.sidebar.warning("⚠️ 檢測到多合約模式，已切換為單一合約模式以獲取即時數據")
+            contracts = contracts[0] if contracts else None
+            if not contracts:
+                st.sidebar.error("❌ 無可用合約")
                 return None
-            
-            # 合併所有數據
-            st.sidebar.caption(f"🔧 正在合併數據...")
-            df = pd.concat(all_dfs)
-            
-            # 移除重複的時間點（保留成交量較大的，如果有 Volume 欄位的話）
-            if 'Volume' in df.columns:
-                df = df.sort_values(['Volume'], ascending=False)
-            df = df[~df.index.duplicated(keep='first')]
-            df = df.sort_index()
-            
-            # 確保有必要的欄位
-            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-            df = df[required_cols]
-            
-            st.sidebar.success(f"✅ 拼接完成！共 {len(df)} 筆原始數據")
-            
-            # 檢查數據間隔並進行重採樣
-            if len(df) > 1:
-                time_diff = (df.index[1] - df.index[0]).total_seconds() / 60
-                st.sidebar.caption(f"⏱️ 數據間隔: {time_diff:.0f} 分鐘")
-                
-                if interval == "1d" and time_diff < 1440:
-                    st.sidebar.caption(f"🔄 正在轉換為日K...")
-                    df = df.resample('1D').agg({
-                        'Open': 'first',
-                        'High': 'max',
-                        'Low': 'min',
-                        'Close': 'last',
-                        'Volume': 'sum'
-                    }).dropna()
-                    st.sidebar.success(f"✅ 轉換完成: {len(df)} 筆日K")
-            
-            return df
-            
+        
+        # 單一合約模式（期貨或股票）
+        contract = contracts
+        
+        # 設定時間範圍 - 即時數據使用更短時間範圍
+        taipei_tz = pytz.timezone('Asia/Taipei')
+        end_date = datetime.now(taipei_tz)
+        
+        if interval == "1d":
+            # 日K取近30天
+            start_date = end_date - timedelta(days=30)
+        elif interval in ["30m", "60m"]:
+            # 60分/30分K取近3天（確保包含夜盤）
+            start_date = end_date - timedelta(days=3)
+        elif interval == "15m":
+            # 15分K取近2天
+            start_date = end_date - timedelta(days=2)
         else:
-            # 單一合約（如股票）
-            contract = contracts
-            st.sidebar.caption(f"🔍 正在獲取 {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')} 的 {interval} 數據...")
-            
+            # 1分/5分K取近12小時（包含夜盤）
+            start_date = end_date - timedelta(hours=12)
+        
+        st.sidebar.caption(f"🔍 合約: {contract.code}")
+        st.sidebar.caption(f"📅 時間範圍: {start_date.strftime('%Y-%m-%d %H:%M')} ~ {end_date.strftime('%Y-%m-%d %H:%M')}")
+        st.sidebar.caption(f"⏱️ 請求週期: {interval}")
+        st.sidebar.caption(f"🕐 台灣時間: {end_date.strftime('%H:%M:%S')}")
+        
+        try:
             kbars = _api.kbars(
                 contract=contract,
                 start=start_date.strftime("%Y-%m-%d"),
                 end=end_date.strftime("%Y-%m-%d")
             )
+        except Exception as kbar_error:
+            error_msg = str(kbar_error)
+            st.sidebar.error(f"❌ kbars API 錯誤: {error_msg[:200]}")
             
-            # 轉換為 DataFrame
-            if kbars is not None:
+            # 如果是 404 錯誤，嘗試更短的時間範圍
+            if "404" in error_msg or "not found" in error_msg.lower():
+                st.sidebar.warning("⚠️ 嘗試使用更短時間範圍...")
+                start_date = end_date - timedelta(days=1)
+                st.sidebar.caption(f"🔄 重試: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
+                
                 try:
-                    df = pd.DataFrame({**kbars})
-                    
-                    if df.empty:
-                        st.warning("⚠️ Shioaji 返回空數據")
-                        st.sidebar.error(f"❌ 合約: {contract.code}, 時間: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
-                        return None
-                    
-                    raw_count = len(df)
-                    st.sidebar.caption(f"📥 Shioaji API 返回 {raw_count} 筆原始數據")
-                    
-                    # 設定時間索引
-                    df['ts'] = pd.to_datetime(df['ts'])
-                    df = df.set_index('ts')
-                    
-                    # 標準化欄位名稱（檢查欄位是否存在）
-                    rename_map = {}
-                    if 'open' in df.columns:
-                        rename_map['open'] = 'Open'
-                    if 'high' in df.columns:
-                        rename_map['high'] = 'High'
-                    if 'low' in df.columns:
-                        rename_map['low'] = 'Low'
-                    if 'close' in df.columns:
-                        rename_map['close'] = 'Close'
-                    if 'volume' in df.columns:
-                        rename_map['volume'] = 'Volume'
-                    
-                    if rename_map:
-                        df = df.rename(columns=rename_map)
-                    
-                    # 如果沒有 Volume，設為0
-                    if 'Volume' not in df.columns:
-                        df['Volume'] = 0
-                        st.sidebar.warning("⚠️ 數據無成交量欄位，已設為0")
-                    
-                    # 檢查數據間隔
-                    if len(df) > 1:
-                        time_diff = (df.index[1] - df.index[0]).total_seconds() / 60
-                        st.sidebar.caption(f"⏱️ 數據間隔: {time_diff:.0f} 分鐘")
-                        
-                        if interval == "1d" and time_diff < 1440:
-                            st.sidebar.warning(f"⚠️ API返回{time_diff:.0f}分K，正在轉換為日K...")
-                            df = df.resample('1D').agg({
-                                'Open': 'first',
-                                'High': 'max',
-                                'Low': 'min',
-                                'Close': 'last',
-                                'Volume': 'sum'
-                            }).dropna()
-                            st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆日K")
-                        elif interval == "60m" and time_diff < 60:
-                            df = df.resample('60min').agg({
-                                'Open': 'first',
-                                'High': 'max',
-                                'Low': 'min',
-                                'Close': 'last',
-                                'Volume': 'sum'
-                            }).dropna()
-                            st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆60分K")
-                        elif interval == "30m" and time_diff < 30:
-                            df = df.resample('30min').agg({
-                                'Open': 'first',
-                                'High': 'max',
-                                'Low': 'min',
-                                'Close': 'last',
-                                'Volume': 'sum'
-                            }).dropna()
-                            st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆30分K")
-                        elif interval == "15m" and time_diff < 15:
-                            df = df.resample('15min').agg({
-                                'Open': 'first',
-                                'High': 'max',
-                                'Low': 'min',
-                                'Close': 'last',
-                                'Volume': 'sum'
-                            }).dropna()
-                            st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆15分K")
-                    
-                    return df
-                except Exception as e:
-                    st.error(f"❌ 資料轉換失敗: {e}")
+                    kbars = _api.kbars(
+                        contract=contract,
+                        start=start_date.strftime("%Y-%m-%d"),
+                        end=end_date.strftime("%Y-%m-%d")
+                    )
+                except Exception as retry_error:
+                    st.sidebar.error(f"❌ 重試失敗: {str(retry_error)[:200]}")
                     return None
             else:
-                st.warning("⚠️ Shioaji 未返回數據")
                 return None
+        
+        # 轉換為 DataFrame
+        if kbars is not None:
+            try:
+                df = pd.DataFrame({**kbars})
+                
+                if df.empty:
+                    st.warning("⚠️ Shioaji 返回空數據")
+                    st.sidebar.error(f"❌ 合約: {contract.code}, 時間: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
+                    return None
+                
+                raw_count = len(df)
+                st.sidebar.caption(f"📥 Shioaji API 返回 {raw_count} 筆原始數據")
+                
+                # 設定時間索引
+                df['ts'] = pd.to_datetime(df['ts'])
+                df = df.set_index('ts')
+                
+                # 標準化欄位名稱（檢查欄位是否存在）
+                rename_map = {}
+                if 'open' in df.columns:
+                    rename_map['open'] = 'Open'
+                if 'high' in df.columns:
+                    rename_map['high'] = 'High'
+                if 'low' in df.columns:
+                    rename_map['low'] = 'Low'
+                if 'close' in df.columns:
+                    rename_map['close'] = 'Close'
+                if 'volume' in df.columns:
+                    rename_map['volume'] = 'Volume'
+                
+                if rename_map:
+                    df = df.rename(columns=rename_map)
+                
+                # 如果沒有 Volume，設為0
+                if 'Volume' not in df.columns:
+                    df['Volume'] = 0
+                    st.sidebar.warning("⚠️ 數據無成交量欄位，已設為0")
+                
+                # 檢查數據間隔
+                if len(df) > 1:
+                    time_diff = (df.index[1] - df.index[0]).total_seconds() / 60
+                    st.sidebar.caption(f"⏱️ 數據間隔: {time_diff:.0f} 分鐘")
+                    
+                    if interval == "1d" and time_diff < 1440:
+                        st.sidebar.warning(f"⚠️ API返回{time_diff:.0f}分K，正在轉換為日K...")
+                        df = df.resample('1D').agg({
+                            'Open': 'first',
+                            'High': 'max',
+                            'Low': 'min',
+                            'Close': 'last',
+                            'Volume': 'sum'
+                        }).dropna()
+                        st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆日K")
+                    elif interval == "60m" and time_diff < 60:
+                        df = df.resample('60min').agg({
+                            'Open': 'first',
+                            'High': 'max',
+                            'Low': 'min',
+                            'Close': 'last',
+                            'Volume': 'sum'
+                        }).dropna()
+                        st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆60分K")
+                    elif interval == "30m" and time_diff < 30:
+                        df = df.resample('30min').agg({
+                            'Open': 'first',
+                            'High': 'max',
+                            'Low': 'min',
+                            'Close': 'last',
+                            'Volume': 'sum'
+                        }).dropna()
+                        st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆30分K")
+                    elif interval == "15m" and time_diff < 15:
+                        df = df.resample('15min').agg({
+                            'Open': 'first',
+                            'High': 'max',
+                            'Low': 'min',
+                            'Close': 'last',
+                            'Volume': 'sum'
+                        }).dropna()
+                        st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆15分K")
+                
+                return df
+            except Exception as e:
+                st.error(f"❌ 資料轉換失敗: {e}")
+                return None
+        else:
+            st.warning("⚠️ Shioaji 未返回數據")
+            return None
             
     except Exception as e:
         st.error(f"❌ Shioaji 數據獲取失敗: {e}")
@@ -795,7 +797,7 @@ def process_kline_data(df, interval, session):
 # 主要數據獲取函數
 def get_data(interval, product, session, use_shioaji=False, api_instance=None):
     """
-    統一的數據獲取接口
+    統一的數據獲取接口，具備容錯機制
     
     參數:
         interval (str): K 線週期
@@ -805,21 +807,56 @@ def get_data(interval, product, session, use_shioaji=False, api_instance=None):
         api_instance: Shioaji API 實例（如果使用 Shioaji）
     
     返回:
-        tuple: (DataFrame, 資料來源名稱)
+        tuple: (DataFrame, 資料來源名稱, 是否為即時數據)
     """
+    df = None
     data_source = ""
+    is_realtime = False
+    
+    # 檢查市場狀態
+    market_status_text, market_is_open, market_session = get_market_status()
+    
     if use_shioaji and api_instance is not None:
-        # 使用 Shioaji
+        # 嘗試使用 Shioaji
+        st.sidebar.info("🔄 嘗試使用 Shioaji API...")
         df = get_data_from_shioaji(api_instance, interval, product, session)
-        data_source = "Shioaji (永豐證券)"
+        
+        if df is not None and not df.empty:
+            data_source = "Shioaji (永豐證券)"
+            is_realtime = market_is_open  # 開盤時為即時數據
+            st.sidebar.success(f"✅ Shioaji 數據獲取成功")
+        else:
+            # Shioaji 失敗，自動降級至 Yahoo Finance
+            st.sidebar.warning("⚠️ Shioaji 數據獲取失敗，自動切換至 Yahoo Finance")
+            df = get_data_from_yahoo(interval, product, session)
+            data_source = "Yahoo Finance (備用)"
+            is_realtime = False
+            
+            if df is not None and not df.empty:
+                st.sidebar.success("✅ Yahoo Finance 數據獲取成功")
     else:
-        # 使用 Yahoo Finance
+        # 直接使用 Yahoo Finance
+        st.sidebar.info("🔄 使用 Yahoo Finance...")
         df = get_data_from_yahoo(interval, product, session)
         data_source = "Yahoo Finance"
+        is_realtime = False
+        
+        if df is not None and not df.empty:
+            st.sidebar.success("✅ Yahoo Finance 數據獲取成功")
+    
+    # 最後的保險：確保有數據
+    if df is None or df.empty:
+        st.sidebar.error("❌ 所有數據源均獲取失敗")
+        return None, "無可用數據", False
     
     # 處理數據並計算技術指標
     processed_df = process_kline_data(df, interval, session)
-    return processed_df, data_source
+    
+    if processed_df is None or processed_df.empty:
+        st.sidebar.error("❌ 數據處理失敗")
+        return None, data_source, is_realtime
+    
+    return processed_df, data_source, is_realtime
 
 # ============================================================
 # 4. 主程式執行：獲取數據並限制K棒數量
@@ -835,27 +872,36 @@ except:
 # 取得資料時傳遞 API 實例
 if use_shioaji_flag:
     api_instance = st.session_state['shioaji_api']
-    df, data_source = get_data(interval_option, product_option, session_option, use_shioaji_flag, api_instance)
+    df, data_source, is_realtime = get_data(interval_option, product_option, session_option, use_shioaji_flag, api_instance)
 else:
-    df, data_source = get_data(interval_option, product_option, session_option, use_shioaji_flag)
+    df, data_source, is_realtime = get_data(interval_option, product_option, session_option, use_shioaji_flag)
 
 # 顯示數據來源和數據量資訊
-if df is not None:
+if df is not None and not df.empty:
     original_count = len(df)
-    st.sidebar.success(f"✅ 已載入 {original_count} 筆 {interval_option} K線數據")
     
-    # 如果數據量少於預期，顯示警告
+    # 根據是否為即時數據顯示不同訊息
+    if is_realtime:
+        st.sidebar.success(f"✅ 已載入 {original_count} 筆 {interval_option} K線數據 [即時]")
+    else:
+        st.sidebar.info(f"📚 已載入 {original_count} 筆 {interval_option} K線數據 [歷史]")
+    
+    # 顯示數據來源
+    st.sidebar.caption(f"📊 數據來源: {data_source}")
+    
+    # 如果數據量少於預期，顯示提示（但不是警告）
     expected_counts = {
-        "1d": 400,   # 約2年交易日
-        "60m": 400,  # 約60天的小時K
-        "30m": 800,  # 約60天的30分K
-        "15m": 1600  # 約30天的15分K
+        "1d": 20,    # 期貨合約約1個月
+        "60m": 100,  # 約1週的小時K
+        "30m": 200,  # 約1週的30分K
+        "15m": 400   # 約1週的15分K
     }
-    expected = expected_counts.get(interval_option, 100)
-    if original_count < expected * 0.5:  # 如果少於預期的50%
-        st.sidebar.warning(f"⚠️ 數據量偏少，預期約 {expected} 筆")
+    expected = expected_counts.get(interval_option, 50)
+    if original_count < expected * 0.3:  # 如果少於預期的30%
+        st.sidebar.caption(f"ℹ️ 提示: 單一期貨合約數據有限，如需更多歷史數據請使用 Yahoo Finance")
 else:
     st.sidebar.error("❌ 數據獲取失敗")
+    st.sidebar.info("💡 建議: 取消勾選 Shioaji 改用 Yahoo Finance 歷史數據")
 
 # 根據使用者設定的最大K棒數限制資料量
 # 永遠取最後的 max_kbars 筆資料，確保滑桿連動正常
@@ -1029,17 +1075,44 @@ if df is not None:
     col3.metric("20 MA", f"{last_row['MA20']:.0f}")           # 20日均線
     col4.metric("成交量", f"{last_row['Volume']:.0f}")        # 成交量
     
-    # 顯示自動更新提示
-    if use_shioaji_flag:
-        st.info("📊 使用 Shioaji 即時數據，每 60 秒自動更新")
+    # 顯示自動更新提示與即時數據
+    # 顯示數據類型與最後更新時間
+    taipei_tz = pytz.timezone('Asia/Taipei')
+    update_time = datetime.now(taipei_tz).strftime('%Y-%m-%d %H:%M:%S')
+    
+    col_status1, col_status2, col_status3 = st.columns(3)
+    col_status1.info(f"📊 數據來源: {data_source}")
+    
+    if is_realtime:
+        col_status2.success(f"🟢 即時數據")
     else:
-        st.info("📊 使用 Yahoo Finance 歷史數據")
+        col_status2.info(f"📚 歷史數據")
+    
+    col_status3.caption(f"🕐 更新: {update_time}")
+    
+    # 自動刷新邏輯（只在即時模式啟用）
+    if auto_refresh and refresh_interval and is_realtime:
+        # 顯示倒數計時
+        countdown_placeholder = st.empty()
+        
+        for remaining in range(refresh_interval, 0, -1):
+            countdown_placeholder.info(f"⏱️ 下次更新倒數: {remaining} 秒")
+            time.sleep(1)
+        
+        countdown_placeholder.success("🔄 正在更新...")
+        time.sleep(0.5)
+        st.rerun()
+    elif auto_refresh and not is_realtime:
+        st.info("ℹ️ 當前為歷史數據，自動刷新已暫停")
 
 else:
     # ------------------------------------------------------------
     # 當數據獲取失敗時顯示錯誤訊息
     # ------------------------------------------------------------
-    st.error("目前無法獲取數據，請確認市場是否開盤或檢查網路連線。")
+    st.error("❌ 目前無法獲取數據")
+    st.warning("💡 建議操作：")
+    st.info("1️⃣ 取消勾選「使用 Shioaji 即時數據」改用 Yahoo Finance\n2️⃣ 檢查 Shioaji 登入狀態\n3️⃣ 確認網路連線正常")
+    st.caption("📝 即使非交易時段，Yahoo Finance 仍可提供歷史K線數據")
 
 # ============================================================
 # 程式結束
