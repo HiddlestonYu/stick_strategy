@@ -579,18 +579,30 @@ def get_data_from_shioaji(_api, interval, product, session):
         taipei_tz = pytz.timezone('Asia/Taipei')
         end_date = datetime.now(taipei_tz)
         
-        if interval == "1d":
-            # 日K取近30天
+        # 特別處理：日K + 指定時段 = 下載分鐘K後彙總
+        download_minute_for_daily = (interval == "1d" and session in ["日盤", "夜盤"])
+        
+        if download_minute_for_daily:
+            # 下載1分鐘K，用於精確過濾時段
+            st.sidebar.caption(f"⚙️ 正在下載分鐘K以彙總{session}日K...")
+            start_date = end_date - timedelta(days=7)  # 下載7天的分鐘K
+            actual_interval = "1m"  # 實際下載1分鐘K
+        elif interval == "1d":
+            # 日K取近30天（全盤模式）
             start_date = end_date - timedelta(days=30)
+            actual_interval = interval
         elif interval in ["30m", "60m"]:
             # 60分/30分K取近3天（確保包含夜盤）
             start_date = end_date - timedelta(days=3)
+            actual_interval = interval
         elif interval == "15m":
             # 15分K取近2天
             start_date = end_date - timedelta(days=2)
+            actual_interval = interval
         else:
             # 1分/5分K取近12小時（包含夜盤）
             start_date = end_date - timedelta(hours=12)
+            actual_interval = interval
         
         st.sidebar.caption(f"🔍 合約: {contract.code}")
         st.sidebar.caption(f"📅 時間範圍: {start_date.strftime('%Y-%m-%d %H:%M')} ~ {end_date.strftime('%Y-%m-%d %H:%M')}")
@@ -668,7 +680,49 @@ def get_data_from_shioaji(_api, interval, product, session):
                     time_diff = (df.index[1] - df.index[0]).total_seconds() / 60
                     st.sidebar.caption(f"⏱️ 數據間隔: {time_diff:.0f} 分鐘")
                     
-                    if interval == "1d" and time_diff < 1440:
+                    # 特別處理：日K + 指定時段，需要先過濾再彙總
+                    if download_minute_for_daily and time_diff < 1440:
+                        st.sidebar.caption(f"⚙️ 過濾{session}時段並彙總為日K...")
+                        
+                        # 過濾時段
+                        hours = df.index.hour
+                        minutes = df.index.minute
+                        
+                        if session == "日盤":
+                            # 日盤：08:45 - 13:45
+                            mask = ((hours == 8) & (minutes >= 45)) | \
+                                   ((hours >= 9) & (hours < 13)) | \
+                                   ((hours == 13) & (minutes <= 45))
+                        else:  # 夜盤
+                            # 夜盤：15:00 - 05:00
+                            mask = (hours >= 15) | (hours < 5)
+                        
+                        df = df[mask]
+                        
+                        if df.empty:
+                            st.sidebar.warning(f"⚠️ {session}時段無數據")
+                            return None
+                        
+                        st.sidebar.caption(f"✅ 過濾後: {len(df)} 筆{session}分鐘K")
+                        
+                        # 彙總為日K
+                        df['Date'] = df.index.date
+                        df = df.groupby('Date').agg({
+                            'Open': 'first',
+                            'High': 'max',
+                            'Low': 'min',
+                            'Close': 'last',
+                            'Volume': 'sum'
+                        })
+                        
+                        # 將日期索引轉換回 DatetimeIndex
+                        df.index = pd.to_datetime(df.index)
+                        df.index = df.index.tz_localize('Asia/Taipei')
+                        
+                        st.sidebar.caption(f"✅ 彙總後: {len(df)} 筆{session}日K")
+                    
+                    elif interval == "1d" and time_diff < 1440:
+                        # 全盤模式的日K（不過濾時段）
                         st.sidebar.warning(f"⚠️ API返回{time_diff:.0f}分K，正在轉換為日K...")
                         df = df.resample('1D').agg({
                             'Open': 'first',
@@ -722,11 +776,80 @@ def get_data_from_shioaji(_api, interval, product, session):
 def get_data_from_yahoo(interval, product, session):
     """
     從 Yahoo Finance 下載 K 線數據（備用方案）
+    
+    特別處理：
+    - 當選擇日K且指定日盤/夜盤時，會下載分鐘K後重新彙總
+    - 確保日盤的日K數據與券商一致
     """
     import yfinance as yf
     
     ticker = get_ticker_symbol(product)
     
+    # 特別處理：日K + 指定時段 = 下載分鐘K後彙總
+    if interval == "1d" and session in ["日盤", "夜盤"]:
+        st.sidebar.caption(f"⚙️ 正在彙總{session}分鐘K為日K...")
+        
+        # 下載15分鐘K（足夠精確且數據量合理）
+        try:
+            df = yf.download(ticker, period="60d", interval="15m", progress=False)
+        except Exception as e:
+            st.error(f"數據下載失敗: {e}")
+            return None
+        
+        if df.empty:
+            return None
+        
+        # 資料清理
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.columns = [col.capitalize() for col in df.columns]
+        
+        # 時區轉換
+        try:
+            df.index = df.index.tz_convert('Asia/Taipei')
+        except (TypeError, AttributeError):
+            try:
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
+            except:
+                df.index = df.index.tz_localize('Asia/Taipei')
+        
+        # 過濾時段
+        hours = df.index.hour
+        minutes = df.index.minute
+        
+        if session == "日盤":
+            # 日盤：08:45 - 13:45
+            mask = ((hours == 8) & (minutes >= 45)) | \
+                   ((hours >= 9) & (hours < 13)) | \
+                   ((hours == 13) & (minutes <= 45))
+        else:  # 夜盤
+            # 夜盤：15:00 - 05:00
+            mask = (hours >= 15) | (hours < 5)
+        
+        df = df[mask]
+        
+        if df.empty:
+            return None
+        
+        # 彙總成日K（每天一根K棒）
+        df['Date'] = df.index.date
+        daily_df = df.groupby('Date').agg({
+            'Open': 'first',   # 開盤：當天第一根K棒的開盤價
+            'High': 'max',     # 最高：當天所有K棒的最高價
+            'Low': 'min',      # 最低：當天所有K棒的最低價
+            'Close': 'last',   # 收盤：當天最後一根K棒的收盤價
+            'Volume': 'sum'    # 成交量：當天總和
+        })
+        
+        # 將日期索引轉換回 DatetimeIndex
+        daily_df.index = pd.to_datetime(daily_df.index)
+        daily_df.index = daily_df.index.tz_localize('Asia/Taipei')
+        
+        st.sidebar.caption(f"📊 Yahoo {session}: {len(daily_df)} 筆日K（從分鐘K彙總）")
+        
+        return daily_df
+    
+    # 一般情況：直接下載對應週期
     if interval == "1d":
         period = "2y"
     elif interval in ["30m", "60m"]:
@@ -825,6 +948,8 @@ def get_data(interval, product, session, use_shioaji=False, api_instance=None):
             data_source = "Shioaji (永豐證券)"
             is_realtime = market_is_open  # 開盤時為即時數據
             st.sidebar.success(f"✅ Shioaji 數據獲取成功")
+            if product == "台指期貨 (TXF)":
+                st.sidebar.caption("ℹ️ 使用台指期貨合約 (TXF)")
         else:
             # Shioaji 失敗，自動降級至 Yahoo Finance
             st.sidebar.warning("⚠️ Shioaji 數據獲取失敗，自動切換至 Yahoo Finance")
@@ -834,6 +959,8 @@ def get_data(interval, product, session, use_shioaji=False, api_instance=None):
             
             if df is not None and not df.empty:
                 st.sidebar.success("✅ Yahoo Finance 數據獲取成功")
+                if product == "台指期貨 (TXF)":
+                    st.sidebar.caption("ℹ️ 使用加權指數 (^TWII) 模擬")
     else:
         # 直接使用 Yahoo Finance
         st.sidebar.info("🔄 使用 Yahoo Finance...")
@@ -843,6 +970,8 @@ def get_data(interval, product, session, use_shioaji=False, api_instance=None):
         
         if df is not None and not df.empty:
             st.sidebar.success("✅ Yahoo Finance 數據獲取成功")
+            if product == "台指期貨 (TXF)":
+                st.sidebar.caption("ℹ️ 使用加權指數 (^TWII) 模擬")
     
     # 最後的保險：確保有數據
     if df is None or df.empty:
@@ -964,7 +1093,13 @@ if df is not None:
         increasing_line_width=2,       # 增加 K 棒線條寬度
         decreasing_line_width=2,       # 增加 K 棒線條寬度
         text=date_labels,     # 將日期作為文字資訊
-        hovertext=date_labels # 懸停時顯示日期
+        hovertext=date_labels, # 懸停時顯示日期
+        hovertemplate='<b>%{text}</b><br>' +
+                      '開盤: %{open:.0f}<br>' +
+                      '最高: %{high:.0f}<br>' +
+                      '最低: %{low:.0f}<br>' +
+                      '收盤: %{close:.0f}<br>' +
+                      '<extra></extra>'  # 移除次要資訊框
     )
     # 將 K 棒加入第一個子圖（row=1）
     fig.add_trace(candlestick, row=1, col=1)
