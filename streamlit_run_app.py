@@ -18,6 +18,8 @@ import shioaji as sj  # Shioaji API，用於獲取台灣期貨和股票即時數
 from datetime import datetime, timedelta  # 日期時間處理
 import pytz  # 時區處理庫，用於處理不同時區的時間
 import time  # 時間處理，用於自動刷新
+import pickle  # 序列化工具，用於資料快取
+import os  # 檔案系統操作
 
 # ============================================================
 # 1. 頁面初始化設定與 Shioaji 連線
@@ -348,8 +350,8 @@ with st.sidebar:
     # 夜盤：15:00 - 次日 05:00
     session_option = st.selectbox(
         "選擇時段",
-        ("全盤", "日盤", "夜盤"),
-        index=0
+        ("日盤", "夜盤", "全盤"),
+        index=0  # 預設日盤
     )
     
     # ------------------------------------------------------------
@@ -367,14 +369,14 @@ with st.sidebar:
     # 3.5 最大K棒數量滑桿
     # ------------------------------------------------------------
     # 限制圖表顯示的 K 棒數量，避免資料過多導致效能問題
-    # 範圍：20-500 根，預設 100 根，每次調整 10 根
+    # 範圍：20-1000 根，預設 100 根，每次調整 10 根
     max_kbars = st.slider(
         "顯示K棒數量",
         min_value=20,
-        max_value=500,
+        max_value=1000,
         value=100,
         step=10,
-        help="設定圖表顯示的最大K棒數量"
+        help="設定圖表顯示的最大K棒數量（使用快取可顯示更多歷史數據）"
     )
     
     st.divider()  # 分隔線
@@ -542,10 +544,86 @@ def filter_by_session(df, session, interval):
         # 返回所有資料不過濾
         return df
 
-@st.cache_data(ttl=3)  # 即時數據快取僅3秒，確保數據即時性
+# ============================================================
+# 資料快取管理函數
+# ============================================================
+def get_cache_path(product, interval, session):
+    """
+    生成快取檔案路徑
+    """
+    cache_dir = "data"
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    
+    # 檔名格式：產品_週期_時段.pkl
+    product_code = product.split("(")[1].split(")")[0] if "(" in product else product
+    filename = f"{product_code}_{interval}_{session}.pkl"
+    return os.path.join(cache_dir, filename)
+
+def load_cache(product, interval, session):
+    """
+    讀取快取資料
+    返回: (DataFrame, 最後更新時間) 或 (None, None)
+    """
+    cache_path = get_cache_path(product, interval, session)
+    
+    if not os.path.exists(cache_path):
+        return None, None
+    
+    try:
+        with open(cache_path, 'rb') as f:
+            cache_data = pickle.load(f)
+            df = cache_data.get('data')
+            last_update = cache_data.get('last_update')
+            return df, last_update
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ 快取讀取失敗: {str(e)[:100]}")
+        return None, None
+
+def save_cache(df, product, interval, session):
+    """
+    儲存快取資料
+    """
+    cache_path = get_cache_path(product, interval, session)
+    
+    try:
+        cache_data = {
+            'data': df,
+            'last_update': datetime.now(pytz.timezone('Asia/Taipei'))
+        }
+        with open(cache_path, 'wb') as f:
+            pickle.dump(cache_data, f)
+        st.sidebar.caption(f"💾 已儲存 {len(df)} 筆數據到快取")
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ 快取儲存失敗: {str(e)[:100]}")
+
+def merge_data(old_df, new_df):
+    """
+    合併舊數據和新數據，去除重複
+    """
+    if old_df is None or old_df.empty:
+        return new_df
+    if new_df is None or new_df.empty:
+        return old_df
+    
+    # 合併並去重（保留最新數據）
+    combined = pd.concat([old_df, new_df])
+    combined = combined[~combined.index.duplicated(keep='last')]
+    combined = combined.sort_index()
+    
+    return combined
+
 def get_data_from_shioaji(_api, interval, product, session):
     """
-    從 Shioaji API 獲取 K 線數據（即時更新）
+    從 Shioaji API 獲取 K 線數據（即時更新）+ 本地快取
+    
+    策略：
+    1. 讀取本地快取（如果有）
+    2. 下載最新數據
+    3. 合併並更新快取
+    4. 返回完整數據
+    
+    注意：不使用 @st.cache_data，因為會影響本地快取累積
     
     參數:
         _api: Shioaji API 實例（前綴 _ 避免被快取）
@@ -557,7 +635,22 @@ def get_data_from_shioaji(_api, interval, product, session):
         pd.DataFrame: K 線數據
     """
     try:
-        # 獲取合約
+        # 1. 讀取本地快取
+        cached_df, last_update = load_cache(product, interval, session)
+        
+        if cached_df is not None and not cached_df.empty:
+            st.sidebar.caption(f"💾 載入快取: {len(cached_df)} 筆歷史數據")
+            st.sidebar.caption(f"📅 快取範圍: {cached_df.index[0].date()} ~ {cached_df.index[-1].date()}")
+            if last_update:
+                st.sidebar.caption(f"🕐 快取更新: {last_update.strftime('%Y-%m-%d %H:%M')}")
+            
+            # 如果快取數據較少，提示可以回溯下載
+            if len(cached_df) < 100:
+                st.sidebar.info(f"💡 快取僅 {len(cached_df)} 筆，可多次重新整理頁面累積數據")
+        else:
+            st.sidebar.caption(f"ℹ️ 無本地快取，首次下載")
+        
+        # 2. 獲取合約
         contracts = get_contract(_api, product)
         if contracts is None:
             st.warning("⚠️ 無法獲取合約，請確認已登入並下載合約資料")
@@ -583,10 +676,11 @@ def get_data_from_shioaji(_api, interval, product, session):
         download_minute_for_daily = (interval == "1d" and session in ["日盤", "夜盤"])
         
         if download_minute_for_daily:
-            # 下載1分鐘K，用於精確過濾時段
-            st.sidebar.caption(f"⚙️ 正在下載分鐘K以彙總{session}日K...")
-            start_date = end_date - timedelta(days=7)  # 下載7天的分鐘K
-            actual_interval = "1m"  # 實際下載1分鐘K
+            # 下載15分鐘K（而非1分鐘K），用於精確過濾時段
+            # 15分鐘K的歷史數據較多，可獲得更長期的數據
+            st.sidebar.caption(f"⚙️ 正在下載15分K以彙總{session}日K...")
+            start_date = end_date - timedelta(days=360)  # 嘗試下載360天
+            actual_interval = "15m"  # 使用15分鐘K（歷史數據較1分鐘K豐富）
         elif interval == "1d":
             # 日K取近30天（全盤模式）
             start_date = end_date - timedelta(days=30)
@@ -649,6 +743,7 @@ def get_data_from_shioaji(_api, interval, product, session):
                 
                 raw_count = len(df)
                 st.sidebar.caption(f"📥 Shioaji API 返回 {raw_count} 筆原始數據")
+                st.sidebar.caption(f"📅 API 數據範圍: {df.index[0]} ~ {df.index[-1]}")
                 
                 # 設定時間索引
                 df['ts'] = pd.to_datetime(df['ts'])
@@ -705,6 +800,12 @@ def get_data_from_shioaji(_api, interval, product, session):
                         
                         st.sidebar.caption(f"✅ 過濾後: {len(df)} 筆{session}分鐘K")
                         
+                        # 顯示過濾後的日期範圍（調試用）
+                        if len(df) > 0:
+                            first_date = df.index[0].date()
+                            last_date = df.index[-1].date()
+                            st.sidebar.caption(f"📅 日期範圍: {first_date} ~ {last_date}")
+                        
                         # 彙總為日K
                         df['Date'] = df.index.date
                         df = df.groupby('Date').agg({
@@ -760,16 +861,37 @@ def get_data_from_shioaji(_api, interval, product, session):
                         }).dropna()
                         st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆15分K")
                 
+                # 3. 合併快取數據和新數據
+                if cached_df is not None and not cached_df.empty:
+                    original_len = len(df)
+                    df = merge_data(cached_df, df)
+                    st.sidebar.caption(f"🔄 合併快取: {original_len} 筆新 + {len(cached_df)} 筆舊 = {len(df)} 筆")
+                
+                # 4. 儲存到快取
+                save_cache(df, product, interval, session)
+                
                 return df
             except Exception as e:
                 st.error(f"❌ 資料轉換失敗: {e}")
+                # 如果處理失敗但有快取，返回快取數據
+                if cached_df is not None and not cached_df.empty:
+                    st.sidebar.warning("⚠️ 使用快取數據")
+                    return cached_df
                 return None
         else:
             st.warning("⚠️ Shioaji 未返回數據")
+            # 如果 API 失敗但有快取，返回快取數據
+            if cached_df is not None and not cached_df.empty:
+                st.sidebar.warning("⚠️ API 失敗，使用快取數據")
+                return cached_df
             return None
             
     except Exception as e:
         st.error(f"❌ Shioaji 數據獲取失敗: {e}")
+        # 如果失敗但有快取，返回快取數據
+        if 'cached_df' in locals() and cached_df is not None and not cached_df.empty:
+            st.sidebar.warning("⚠️ 發生錯誤，使用快取數據")
+            return cached_df
         return None
 
 @st.cache_data(ttl=60)
@@ -1009,14 +1131,14 @@ else:
 if df is not None and not df.empty:
     original_count = len(df)
     
+    # 顯示數據來源
+    st.sidebar.caption(f"📊 數據來源: {data_source}")
+    
     # 根據是否為即時數據顯示不同訊息
     if is_realtime:
         st.sidebar.success(f"✅ 已載入 {original_count} 筆 {interval_option} K線數據 [即時]")
     else:
         st.sidebar.info(f"📚 已載入 {original_count} 筆 {interval_option} K線數據 [歷史]")
-    
-    # 顯示數據來源
-    st.sidebar.caption(f"📊 數據來源: {data_source}")
     
     # 如果數據量少於預期，顯示提示（但不是警告）
     expected_counts = {
@@ -1033,20 +1155,44 @@ else:
     st.sidebar.info("💡 建議: 取消勾選 Shioaji 改用 Yahoo Finance 歷史數據")
 
 # 根據使用者設定的最大K棒數限制資料量
-# 永遠取最後的 max_kbars 筆資料，確保滑桿連動正常
+# 策略：先多取 20 筆用於 MA 計算，計算完後再裁切
 if df is not None:
-    before_trim = len(df)
-    if len(df) > max_kbars:
-        df = df.tail(max_kbars)
-        st.sidebar.info(f"📊 圖表顯示最新 {len(df)}/{before_trim} 筆")
+    original_count = len(df)
+    
+    # 計算所需的最大窗口（MA20 需要 20 筆）
+    ma_window = 20
+    
+    # 如果數據量大於需要顯示的數量，先保留足夠計算 MA 的數據
+    if original_count > max_kbars:
+        # 裁切前顯示原始數據量
+        st.sidebar.info(f"📊 原始數據: {original_count} 筆")
+        
+        # 取最後 (max_kbars + ma_window) 筆，確保 MA 計算完整
+        needed_for_ma = max_kbars + ma_window
+        if original_count >= needed_for_ma:
+            df_for_calc = df.tail(needed_for_ma)
+            st.sidebar.caption(f"⚙️ 計算用數據: {len(df_for_calc)} 筆 (含 MA 緩衝)")
+        else:
+            df_for_calc = df
+            st.sidebar.caption(f"⚙️ 使用全部 {len(df_for_calc)} 筆數據計算")
+        
+        # 重新計算 MA（確保完整）
+        df_for_calc = df_for_calc.copy()
+        df_for_calc['MA10'] = df_for_calc['Close'].rolling(window=10).mean()
+        df_for_calc['MA20'] = df_for_calc['Close'].rolling(window=20).mean()
+        
+        # 最後只取需要顯示的部分
+        df = df_for_calc.tail(max_kbars)
+        st.sidebar.info(f"📊 圖表顯示最新 {len(df)}/{original_count} 筆 (滑桿限制: {max_kbars})")
     else:
-        st.sidebar.info(f"📊 圖表顯示全部 {len(df)} 筆數據")
+        # 數據量不足，全部顯示
+        st.sidebar.info(f"📊 圖表顯示全部 {len(df)} 筆數據 (滑桿設定: {max_kbars})")
     
     # 顯示當前顯示的數據範圍
     if len(df) > 0:
         first_date = df.index[0].strftime('%Y-%m-%d') if hasattr(df.index[0], 'strftime') else str(df.index[0])
         last_date = df.index[-1].strftime('%Y-%m-%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
-        st.sidebar.caption(f"📅 {first_date} ~ {last_date}")
+        st.sidebar.caption(f"📅 顯示範圍: {first_date} ~ {last_date}")
 
 # ============================================================
 # 5. 繪製互動式 K 線圖 (Visualization)
@@ -1115,7 +1261,8 @@ if df is not None:
             line=dict(color='orange', width=1.5), 
             name='10 MA',
             text=date_labels,
-            hovertext=date_labels
+            hovertext=date_labels,
+            hovertemplate='<b>%{text}</b><br>MA10: %{y:.0f}<extra></extra>'
         ), 
         row=1, col=1
     )
@@ -1128,7 +1275,8 @@ if df is not None:
             line=dict(color='purple', width=1.5), 
             name='20 MA',
             text=date_labels,
-            hovertext=date_labels
+            hovertext=date_labels,
+            hovertemplate='<b>%{text}</b><br>MA20: %{y:.0f}<extra></extra>'
         ), 
         row=1, col=1
     )
