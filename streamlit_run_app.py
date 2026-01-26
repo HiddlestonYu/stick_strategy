@@ -348,21 +348,33 @@ with st.sidebar:
     # 全盤：顯示所有交易時段
     # 日盤：08:45 - 13:45
     # 夜盤：15:00 - 次日 05:00
+    # 根據當前時間自動選擇時段
+    taipei_tz = pytz.timezone('Asia/Taipei')
+    current_hour = datetime.now(taipei_tz).hour
+    # 夜盤時間：15:00-23:59 或 00:00-05:00
+    if current_hour >= 15 or current_hour < 5:
+        default_session_index = 1  # 夜盤
+    # 日盤時間：08:45-13:45
+    elif 8 <= current_hour < 14:
+        default_session_index = 0  # 日盤
+    else:
+        default_session_index = 2  # 全盤
+    
     session_option = st.selectbox(
         "選擇時段",
         ("日盤", "夜盤", "全盤"),
-        index=0  # 預設日盤
+        index=default_session_index
     )
     
     # ------------------------------------------------------------
     # 3.4 K線週期選擇
     # ------------------------------------------------------------
     # 支援從 1 分鐘到日線的多種時間週期
-    # index=5 表示預設選擇日K（1d）
+    # index=0 表示預設選擇1分K（1m）以看到動態更新
     interval_option = st.selectbox(
         "選擇 K 線週期",
         ("1m", "5m", "15m", "30m", "60m", "1d"),
-        index=5  # 預設 日K
+        index=0  # 預設 1分K
     )
     
     # ------------------------------------------------------------
@@ -389,7 +401,7 @@ with st.sidebar:
     with st.expander("⚡ 即時更新設定", expanded=True):
         auto_refresh = st.checkbox(
             "啟用自動刷新", 
-            value=False,
+            value=True,  # 預設啟用
             help="啟用後，圖表會自動更新以顯示最新即時數據"
         )
         
@@ -398,7 +410,7 @@ with st.sidebar:
                 "刷新間隔（秒）",
                 min_value=1,
                 max_value=60,
-                value=3,
+                value=1,  # 預設1秒更新
                 step=1,
                 help="設定圖表自動更新的時間間隔"
             )
@@ -700,15 +712,26 @@ def get_data_from_shioaji(_api, interval, product, session):
         
         st.sidebar.caption(f"🔍 合約: {contract.code}")
         st.sidebar.caption(f"📅 時間範圍: {start_date.strftime('%Y-%m-%d %H:%M')} ~ {end_date.strftime('%Y-%m-%d %H:%M')}")
-        st.sidebar.caption(f"⏱️ 請求週期: {interval}")
+        st.sidebar.caption(f"⏱️ 請求週期: {actual_interval}")
         st.sidebar.caption(f"🕐 台灣時間: {end_date.strftime('%H:%M:%S')}")
         
         try:
-            kbars = _api.kbars(
-                contract=contract,
-                start=start_date.strftime("%Y-%m-%d"),
-                end=end_date.strftime("%Y-%m-%d")
-            )
+            # 構建 kbars 參數
+            kbars_params = {
+                'contract': contract,
+                'start': start_date.strftime("%Y-%m-%d"),
+                'end': end_date.strftime("%Y-%m-%d")
+            }
+            
+            # 根據週期設定 timeout（分鐘K需要較長時間）
+            if actual_interval in ["1m", "5m"]:
+                timeout_seconds = 30
+            else:
+                timeout_seconds = 10
+            
+            st.sidebar.caption(f"🔄 正在下載 {actual_interval} K線數據...")
+            
+            kbars = _api.kbars(**kbars_params)
         except Exception as kbar_error:
             error_msg = str(kbar_error)
             st.sidebar.error(f"❌ kbars API 錯誤: {error_msg[:200]}")
@@ -720,11 +743,12 @@ def get_data_from_shioaji(_api, interval, product, session):
                 st.sidebar.caption(f"🔄 重試: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
                 
                 try:
-                    kbars = _api.kbars(
-                        contract=contract,
-                        start=start_date.strftime("%Y-%m-%d"),
-                        end=end_date.strftime("%Y-%m-%d")
-                    )
+                    retry_params = {
+                        'contract': contract,
+                        'start': start_date.strftime("%Y-%m-%d"),
+                        'end': end_date.strftime("%Y-%m-%d")
+                    }
+                    kbars = _api.kbars(**retry_params)
                 except Exception as retry_error:
                     st.sidebar.error(f"❌ 重試失敗: {str(retry_error)[:200]}")
                     return None
@@ -743,11 +767,21 @@ def get_data_from_shioaji(_api, interval, product, session):
                 
                 raw_count = len(df)
                 st.sidebar.caption(f"📥 Shioaji API 返回 {raw_count} 筆原始數據")
-                st.sidebar.caption(f"📅 API 數據範圍: {df.index[0]} ~ {df.index[-1]}")
-                
-                # 設定時間索引
+                # 設定時間索引（先不顯示範圍，因為時區可能不正確）
                 df['ts'] = pd.to_datetime(df['ts'])
+                
+                # 檢查時區並轉換為台灣時間
+                if df['ts'].dt.tz is None:
+                    # 如果是 naive datetime，假設 Shioaji 返回的是 UTC+0
+                    df['ts'] = df['ts'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei')
+                    st.sidebar.caption("🌍 時區: UTC → Asia/Taipei")
+                else:
+                    # 如果已有時區，轉換為台灣時間
+                    df['ts'] = df['ts'].dt.tz_convert('Asia/Taipei')
+                    st.sidebar.caption(f"🌍 時區: {df['ts'].dt.tz} → Asia/Taipei")
+                
                 df = df.set_index('ts')
+                st.sidebar.caption(f"📅 API 數據範圍: {df.index[0]} ~ {df.index[-1]}")
                 
                 # 標準化欄位名稱（檢查欄位是否存在）
                 rename_map = {}
@@ -818,7 +852,11 @@ def get_data_from_shioaji(_api, interval, product, session):
                         
                         # 將日期索引轉換回 DatetimeIndex
                         df.index = pd.to_datetime(df.index)
-                        df.index = df.index.tz_localize('Asia/Taipei')
+                        # 檢查是否已有時區
+                        if df.index.tz is None:
+                            df.index = df.index.tz_localize('Asia/Taipei')
+                        else:
+                            df.index = df.index.tz_convert('Asia/Taipei')
                         
                         st.sidebar.caption(f"✅ 彙總後: {len(df)} 筆{session}日K")
                     
@@ -860,14 +898,52 @@ def get_data_from_shioaji(_api, interval, product, session):
                             'Volume': 'sum'
                         }).dropna()
                         st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆15分K")
+                    elif interval == "5m" and time_diff < 5:
+                        df = df.resample('5min').agg({
+                            'Open': 'first',
+                            'High': 'max',
+                            'Low': 'min',
+                            'Close': 'last',
+                            'Volume': 'sum'
+                        }).dropna()
+                        st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆5分K")
+                    elif interval == "1m" and time_diff > 1:
+                        # 如果API返回的不是1分K（例如5分K），但用戶要1分K
+                        st.sidebar.warning(f"⚠️ API返回{time_diff:.0f}分K，無法轉換為1分K（數據不足）")
                 
-                # 3. 合併快取數據和新數據
+                # 3. 獲取即時報價並更新最後一根K棒（非日K才需要）
+                if interval != "1d" and len(df) > 0:
+                    try:
+                        # 使用 snapshots 獲取最新報價
+                        snapshot = _api.snapshots([contract])
+                        if snapshot and len(snapshot) > 0:
+                            latest_price = snapshot[0].close
+                            if latest_price and latest_price > 0:
+                                # 更新最後一根K棒（模擬進行中的K棒）
+                                last_idx = df.index[-1]
+                                
+                                # 如果最新價格高於最高價，更新最高價
+                                if latest_price > df.loc[last_idx, 'High']:
+                                    df.loc[last_idx, 'High'] = latest_price
+                                
+                                # 如果最新價格低於最低價，更新最低價
+                                if latest_price < df.loc[last_idx, 'Low']:
+                                    df.loc[last_idx, 'Low'] = latest_price
+                                
+                                # 更新收盤價為最新價格
+                                df.loc[last_idx, 'Close'] = latest_price
+                                
+                                st.sidebar.caption(f"⚡ 即時價格: {latest_price:.0f} (已更新至最後一根K棒)")
+                    except Exception as snapshot_error:
+                        st.sidebar.caption(f"⚠️ 無法獲取即時報價: {str(snapshot_error)[:50]}")
+                
+                # 4. 合併快取數據和新數據
                 if cached_df is not None and not cached_df.empty:
                     original_len = len(df)
                     df = merge_data(cached_df, df)
                     st.sidebar.caption(f"🔄 合併快取: {original_len} 筆新 + {len(cached_df)} 筆舊 = {len(df)} 筆")
                 
-                # 4. 儲存到快取
+                # 5. 儲存到快取
                 save_cache(df, product, interval, session)
                 
                 return df
