@@ -44,5 +44,16 @@ test_*.py
 *.xlsx
 *.json
 
+# Database files
+*.db
+*.db-journal
+data/
+
+# Security - Certificates
+*.pfx
+*.p12
+*.key
+*.pem
+
 # Skills (測試用)
 .github/skills/
