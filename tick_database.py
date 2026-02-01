@@ -51,51 +51,62 @@ def init_database():
 
 def save_tick(tick_data):
     """
-    儲存單筆 tick 到 database
+    儲存單筆 tick 到 database（不建議大量使用，請用 save_ticks_batch）
+    """
+    return save_ticks_batch([tick_data])
+
+def save_ticks_batch(ticks_list):
+    """
+    批次儲存多筆 ticks 到 database（效能更好）
     
     參數:
-        tick_data (dict): tick 數據，包含 ts, close, volume 等
+        ticks_list (list): tick_data 字典的列表
     """
+    if not ticks_list:
+        return True
+    
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # 確保時間戳為 UTC 格式字串
-        ts = tick_data.get('ts')
-        if isinstance(ts, datetime):
-            if ts.tzinfo is None:
-                # 無時區，假設為 UTC
-                ts_str = ts.isoformat() + 'Z'
+        batch_data = []
+        for tick_data in ticks_list:
+            # 確保時間戳為 UTC 格式字串
+            ts = tick_data.get('ts')
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    ts_str = ts.isoformat() + 'Z'
+                else:
+                    ts_utc = ts.astimezone(pytz.UTC)
+                    ts_str = ts_utc.isoformat()
             else:
-                # 轉換為 UTC
-                ts_utc = ts.astimezone(pytz.UTC)
-                ts_str = ts_utc.isoformat()
-        else:
-            ts_str = str(ts)
+                ts_str = str(ts)
+            
+            batch_data.append((
+                ts_str,
+                tick_data.get('code', 'TXF'),
+                tick_data.get('open'),
+                tick_data.get('high'),
+                tick_data.get('low'),
+                tick_data.get('close'),
+                tick_data.get('volume', 0),
+                tick_data.get('bid_price'),
+                tick_data.get('ask_price'),
+                tick_data.get('bid_volume'),
+                tick_data.get('ask_volume')
+            ))
         
-        cursor.execute("""
+        cursor.executemany("""
             INSERT OR REPLACE INTO ticks 
             (ts, code, open, high, low, close, volume, bid_price, ask_price, bid_volume, ask_volume)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            ts_str,
-            tick_data.get('code', 'TXF'),
-            tick_data.get('open'),
-            tick_data.get('high'),
-            tick_data.get('low'),
-            tick_data.get('close'),
-            tick_data.get('volume', 0),
-            tick_data.get('bid_price'),
-            tick_data.get('ask_price'),
-            tick_data.get('bid_volume'),
-            tick_data.get('ask_volume')
-        ))
+        """, batch_data)
         
         conn.commit()
         conn.close()
         return True
     except Exception as e:
-        print(f"❌ 儲存 tick 失敗: {e}")
+        print(f"❌ 批次儲存 ticks 失敗: {e}")
         return False
 
 def get_ticks(start_time, end_time, code='TXF'):
@@ -153,8 +164,8 @@ def get_ticks(start_time, end_time, code='TXF'):
         conn.close()
         
         if not df.empty:
-            # 將字串轉為 datetime，明確設定為 Asia/Taipei 時區
-            df['ts'] = pd.to_datetime(df['ts'], utc=True).dt.tz_convert('Asia/Taipei')
+            # 將字串轉為 datetime，使用 mixed 格式處理不同的時間格式
+            df['ts'] = pd.to_datetime(df['ts'], format='mixed', utc=True).dt.tz_convert('Asia/Taipei')
             df.set_index('ts', inplace=True)
         
         return df

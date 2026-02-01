@@ -662,9 +662,9 @@ def get_data_from_shioaji(_api, interval, product, session):
         elif interval in ["30m", "60m"]:
             days = 7   # 30分/60分K回溯7天
         elif interval == "15m":
-            days = 3   # 15分K回溯3天
+            days = 5   # 15分K回溯5天
         else:
-            days = 1   # 1分/5分K回溯1天
+            days = 5   # 1分/5分K回溯5天（修正：原本1天讀不到資料）
         
         # 從 database 讀取並組成 K 棒
         df = get_kbars_from_db(interval=interval, session=session, days=days)
