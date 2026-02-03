@@ -178,7 +178,7 @@ def resample_ticks_to_kbars(ticks_df, interval='1d', session='全盤'):
     將 ticks 重採樣為 K 棒
     
     參數:
-        ticks_df (pd.DataFrame): ticks 數據
+        ticks_df (pd.DataFrame): ticks 數據（注意：從 database 讀取的已經是 1分K 而非真正的 ticks）
         interval (str): K線週期 (1m, 5m, 15m, 30m, 60m, 1d)
         session (str): 交易時段 (日盤, 夜盤, 全盤)
         
@@ -192,12 +192,27 @@ def resample_ticks_to_kbars(ticks_df, interval='1d', session='全盤'):
     if session != "全盤":
         hours = ticks_df.index.hour
         minutes = ticks_df.index.minute
+        dates = ticks_df.index.date
         
         if session == "日盤":
-            # 日盤：08:45 - 13:45（包含13:45收盤）
-            mask = ((hours == 8) & (minutes >= 45)) | \
-                   ((hours >= 9) & (hours < 13)) | \
-                   ((hours == 13) & (minutes <= 45))
+            # 導入結算日判斷
+            from settlement_utils import is_settlement_day
+            
+            # 日盤：08:45 - 13:45（一般日）或 08:45 - 13:30（結算日）
+            # 需要逐日判斷收盤時間
+            mask = pd.Series(False, index=ticks_df.index)
+            
+            for date in pd.unique(dates):
+                # 判斷當日是否為結算日
+                end_minute = 30 if is_settlement_day(date) else 45
+                
+                # 該日的時間過濾
+                date_mask = (dates == date) & (
+                    ((hours == 8) & (minutes >= 45)) |
+                    ((hours >= 9) & (hours < 13)) |
+                    ((hours == 13) & (minutes <= end_minute))
+                )
+                mask |= date_mask
         else:  # 夜盤
             # 夜盤：15:00 - 05:00
             mask = (hours >= 15) | (hours < 5)
@@ -207,9 +222,15 @@ def resample_ticks_to_kbars(ticks_df, interval='1d', session='全盤'):
         if ticks_df.empty:
             return pd.DataFrame()
     
-    # 重採樣規則
+    # 如果是 1 分 K，直接返回（不需要 resample，因為 database 中存的已經是 1分K）
+    if interval == '1m':
+        # 標準化欄位名稱
+        result = ticks_df.copy()
+        result.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        return result
+    
+    # 重採樣規則（5分K以上才需要 resample）
     resample_rules = {
-        '1m': '1min',
         '5m': '5min',
         '15m': '15min',
         '30m': '30min',
