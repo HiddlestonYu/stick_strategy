@@ -86,8 +86,9 @@ for target_date in dates_to_fetch:
         # 設定 datetime 為 index
         df = df.set_index("datetime").sort_index()
         
-        # 只保留目標日期
-        df = df[df.index.date == target_date]
+        # 只保留：目標日期 + 隔日 00:00-05:00（夜盤跨日，週末也要補齊）
+        next_date = target_date + timedelta(days=1)
+        df = df[(df.index.date == target_date) | ((df.index.date == next_date) & (df.index.hour < 5)) | ((df.index.date == next_date) & (df.index.hour == 5) & (df.index.minute == 0))]
         
         if df.empty:
             print(f"  [!] 過濾後無數據\n")

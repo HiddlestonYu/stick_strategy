@@ -2,13 +2,28 @@
 使用 api.kbars() 抓取最近 5 天的完整 K 線數據（改良版）
 參考 test_shioaji_kbar.ipynb 的方法
 """
+import argparse
 import shioaji as sj
 from datetime import datetime, timedelta
-import pytz
 import pandas as pd
 from tick_database import save_ticks_batch
 import sqlite3
 from pathlib import Path
+import pytz
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="抓取並更新 TXFR1 1 分 K 至 SQLite（含跨日夜盤）")
+    parser.add_argument(
+        "--date",
+        type=str,
+        default=None,
+        help="指定單一日期（YYYY-MM-DD），會同時補齊隔日 00:00-05:00 夜盤跨日資料",
+    )
+    return parser.parse_args()
+
+
+args = parse_args()
 
 # 登入 Shioaji
 api = sj.Shioaji()
@@ -24,30 +39,41 @@ print(f"[OK] 登入成功\n")
 contract = api.Contracts.Futures.TXF.TXFR1
 print(f"合約: {contract.code}\n")
 
-# 要抓取的日期清單（最近 5 天的交易日）
+# 要抓取的日期清單（最近 8 個交易日 / 或指定單一日期）
 taipei_tz = pytz.timezone('Asia/Taipei')
 today = datetime.now(taipei_tz)
 
 dates_to_fetch = []
-for days_back in range(15):  # 往回推 15 天找出 8 個交易日
-    date = (today - timedelta(days=days_back)).date()
-    # 跳過週末
-    if date.weekday() < 5:
-        dates_to_fetch.append(date)
-    if len(dates_to_fetch) >= 8:  # 增加到 8 天
-        break
+if args.date:
+    target = datetime.strptime(args.date, "%Y-%m-%d").date()
+    dates_to_fetch = [target]
+else:
+    for days_back in range(15):  # 往回推 15 天找出 8 個交易日
+        date = (today - timedelta(days=days_back)).date()
+        # 跳過週末
+        if date.weekday() < 5:
+            dates_to_fetch.append(date)
+        if len(dates_to_fetch) >= 8:  # 增加到 8 天
+            break
 
 print(f"準備抓取以下日期的 K 線:")
 for d in dates_to_fetch:
     print(f"  - {d}")
 print()
 
-# 清除這些日期的舊數據
+# 清除這些日期的舊數據（使用 UTC 範圍，並包含隔日 05:00）
 db_path = Path(__file__).parent / "data" / "txf_ticks.db"
 conn = sqlite3.connect(str(db_path))
 cursor = conn.cursor()
 for date in dates_to_fetch:
-    cursor.execute("DELETE FROM ticks WHERE code='TXFR1' AND ts LIKE ?", (f'{date}%',))
+    start_local = taipei_tz.localize(datetime(date.year, date.month, date.day, 0, 0, 0))
+    end_local = start_local + timedelta(days=1, hours=6)
+    start_utc = start_local.astimezone(pytz.UTC).isoformat()
+    end_utc = end_local.astimezone(pytz.UTC).isoformat()
+    cursor.execute(
+        "DELETE FROM ticks WHERE code=? AND ts >= ? AND ts < ?",
+        ('TXFR1', start_utc, end_utc)
+    )
 conn.commit()
 conn.close()
 print("[OK] 已清除舊數據\n")
@@ -84,8 +110,9 @@ for target_date in dates_to_fetch:
         # 設定 datetime 為 index
         df = df.set_index("datetime").sort_index()
         
-        # 只保留目標日期
-        df = df[df.index.date == target_date]
+        # 只保留：目標日期 + 隔日 00:00-05:00（夜盤跨日，週末也要補齊）
+        next_date = target_date + timedelta(days=1)
+        df = df[(df.index.date == target_date) | ((df.index.date == next_date) & (df.index.hour < 5)) | ((df.index.date == next_date) & (df.index.hour == 5) & (df.index.minute == 0))]
         
         if df.empty:
             print(f"  [!] 過濾後無數據\n")
@@ -150,67 +177,7 @@ for target_date in dates_to_fetch:
         traceback.print_exc()
         continue
 
-print(f"\n{'='*60}")
-print("驗證 2026-01-30 數據")
-print(f"{'='*60}")
-conn = sqlite3.connect(str(db_path))
-cursor = conn.cursor()
-
-# 檢查 2026-01-30
-for check_date in ['2026-01-30', '2026-02-02']:
-    cursor.execute("""
-        SELECT COUNT(*), MIN(ts), MAX(ts) 
-        FROM ticks 
-        WHERE code='TXFR1' AND ts >= ? AND ts < ?
-    """, (f'{check_date} 00:00:00', f'{check_date} 23:59:59'))
-    row = cursor.fetchone()
-    
-    if row[0] == 0:
-        print(f"\n{check_date}: 無數據")
-        continue
-    
-    print(f"\n{check_date}:")
-    print(f"  總計: {row[0]} 筆")
-    print(f"  時間範圍: {row[1]} ~ {row[2]}")
-    
-    # 日盤數據
-    cursor.execute("""
-        SELECT ts, close 
-        FROM ticks 
-        WHERE code='TXFR1' 
-            AND ts >= ? AND ts < ?
-        ORDER BY ts 
-        LIMIT 1
-    """, (f'{check_date} 08:45:00', f'{check_date} 14:00:00'))
-    first = cursor.fetchone()
-    
-    cursor.execute("""
-        SELECT ts, close 
-        FROM ticks 
-        WHERE code='TXFR1' 
-            AND ts >= ? AND ts < ?
-        ORDER BY ts DESC
-        LIMIT 1
-    """, (f'{check_date} 08:45:00', f'{check_date} 14:00:00'))
-    last = cursor.fetchone()
-    
-    cursor.execute("""
-        SELECT MAX(close), MIN(close)
-        FROM ticks 
-        WHERE code='TXFR1' 
-            AND ts >= ? AND ts < ?
-    """, (f'{check_date} 08:45:00', f'{check_date} 14:00:00'))
-    high_low = cursor.fetchone()
-    
-    if first and last:
-        print(f"  日盤開盤: {first[0]} = {first[1]}")
-        print(f"  日盤收盤: {last[0]} = {last[1]}")
-        print(f"  日盤最高: {high_low[0]}")
-        print(f"  日盤最低: {high_low[1]}")
-
-conn.close()
-
 api.logout()
 print(f"\n{'='*60}")
-print("[OK] 完成！請重新啟動 Streamlit app")
+print("[OK] 完成！")
 print(f"{'='*60}")

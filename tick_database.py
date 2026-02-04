@@ -173,6 +173,94 @@ def get_ticks(start_time, end_time, code='TXF'):
         print(f"❌ 讀取 ticks 失敗: {e}")
         return pd.DataFrame()
 
+def get_latest_tick_timestamp(code='TXF', date=None):
+    """
+    取得最新一筆 tick 的時間戳（Asia/Taipei）
+    
+    參數:
+        code (str): 合約代碼（'TXF' 代表所有 TXF 系列）
+        date (datetime.date|None): 指定日期（台北時間）
+        
+    返回:
+        datetime | None
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        if date is not None:
+            taipei_tz = pytz.timezone('Asia/Taipei')
+            start_local = taipei_tz.localize(datetime(date.year, date.month, date.day, 0, 0, 0))
+            end_local = start_local + timedelta(days=1)
+            start_utc = start_local.astimezone(pytz.UTC).isoformat()
+            end_utc = end_local.astimezone(pytz.UTC).isoformat()
+            
+            if code == 'TXF':
+                query = """
+                    SELECT MAX(ts) FROM ticks
+                    WHERE code LIKE 'TXF%' AND ts BETWEEN ? AND ?
+                """
+                cursor.execute(query, (start_utc, end_utc))
+            else:
+                query = """
+                    SELECT MAX(ts) FROM ticks
+                    WHERE code = ? AND ts BETWEEN ? AND ?
+                """
+                cursor.execute(query, (code, start_utc, end_utc))
+        else:
+            if code == 'TXF':
+                query = "SELECT MAX(ts) FROM ticks WHERE code LIKE 'TXF%'"
+                cursor.execute(query)
+            else:
+                query = "SELECT MAX(ts) FROM ticks WHERE code = ?"
+                cursor.execute(query, (code,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row or row[0] is None:
+            return None
+        
+        ts = pd.to_datetime(row[0], format='mixed', utc=True).tz_convert('Asia/Taipei')
+        return ts
+    except Exception as e:
+        print(f"❌ 取得最新時間失敗: {e}")
+        return None
+
+def has_date_data(date, code='TXF'):
+    """
+    判斷指定日期是否已有資料（台北時間）
+    """
+    try:
+        taipei_tz = pytz.timezone('Asia/Taipei')
+        start_local = taipei_tz.localize(datetime(date.year, date.month, date.day, 0, 0, 0))
+        end_local = start_local + timedelta(days=1)
+        start_utc = start_local.astimezone(pytz.UTC).isoformat()
+        end_utc = end_local.astimezone(pytz.UTC).isoformat()
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        if code == 'TXF':
+            query = """
+                SELECT COUNT(*) FROM ticks
+                WHERE code LIKE 'TXF%' AND ts BETWEEN ? AND ?
+            """
+            cursor.execute(query, (start_utc, end_utc))
+        else:
+            query = """
+                SELECT COUNT(*) FROM ticks
+                WHERE code = ? AND ts BETWEEN ? AND ?
+            """
+            cursor.execute(query, (code, start_utc, end_utc))
+        
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count > 0
+    except Exception as e:
+        print(f"❌ 檢查日期資料失敗: {e}")
+        return False
+
 def resample_ticks_to_kbars(ticks_df, interval='1d', session='全盤'):
     """
     將 ticks 重採樣為 K 棒
@@ -214,14 +302,88 @@ def resample_ticks_to_kbars(ticks_df, interval='1d', session='全盤'):
                 )
                 mask |= date_mask
         else:  # 夜盤
-            # 夜盤：15:00 - 05:00
-            mask = (hours >= 15) | (hours < 5)
+            # 夜盤：15:00 - 05:00（包含 05:00 這一根）
+            mask = (hours >= 15) | (hours < 5) | ((hours == 5) & (minutes == 0))
         
         ticks_df = ticks_df[mask]
         
         if ticks_df.empty:
             return pd.DataFrame()
     
+    # 全盤日K：以「交易日」彙總（前一日 15:00 ~ 當日 13:45/13:30）
+    # 避免夜盤被午夜切割、並支援結算日 13:30 收盤
+    if interval == '1d' and session == '全盤':
+        df = ticks_df.copy()
+        idx = df.index
+
+        if idx.tz is None:
+            idx = idx.tz_localize('Asia/Taipei')
+            df.index = idx
+
+        hours = idx.hour
+        minutes = idx.minute
+
+        # 交易日歸屬：15:00~23:59 歸「隔日」；00:00~14:59 歸「當日」
+        trade_date = pd.Series(idx.date, index=df.index)
+        trade_date = trade_date.where(hours < 15, (idx + pd.Timedelta(days=1)).date)
+
+        # 夜盤時間：15:00 - 05:00（含 05:00 這一根）
+        night_mask = (hours >= 15) | (hours < 5) | ((hours == 5) & (minutes == 0))
+
+        # 日盤時間：08:45 - 13:45（一般日）或 08:45 - 13:30（結算日）
+        from settlement_utils import is_settlement_day
+        day_mask = pd.Series(False, index=df.index)
+        dates = trade_date.values
+        for d in pd.unique(dates):
+            end_minute = 30 if is_settlement_day(d) else 45
+            dm = (trade_date == d) & (
+                ((hours == 8) & (minutes >= 45)) |
+                ((hours >= 9) & (hours < 13)) |
+                ((hours == 13) & (minutes <= end_minute))
+            )
+            day_mask |= dm
+
+        df = df[night_mask | day_mask]
+        if df.empty:
+            return pd.DataFrame()
+
+        group_idx = pd.to_datetime(trade_date.loc[df.index]).dt.tz_localize('Asia/Taipei')
+        grouped = df.groupby(group_idx).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+
+        grouped.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        grouped.index.name = 'ts'
+        return grouped.sort_index()
+
+    # 夜盤日K：以「交易時段」(15:00~隔日05:00) 彙總，避免被午夜切成兩根
+    if interval == '1d' and session == '夜盤':
+        df = ticks_df.copy()
+        idx = df.index
+
+        # 交易時段歸屬日：15:00~23:59 歸當日；00:00~05:00(含) 歸前一日
+        hours = idx.hour
+        session_date = pd.Series(idx.date, index=df.index)
+        early_mask = hours < 15
+        session_date = session_date.where(~early_mask, (idx - pd.Timedelta(days=1)).date)
+        session_day = pd.to_datetime(session_date).dt.tz_localize('Asia/Taipei')
+
+        grouped = df.groupby(session_day).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+
+        grouped.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        grouped.index.name = 'ts'
+        return grouped.sort_index()
+
     # 如果是 1 分 K，直接返回（不需要 resample，因為 database 中存的已經是 1分K）
     if interval == '1m':
         # 標準化欄位名稱
@@ -241,7 +403,12 @@ def resample_ticks_to_kbars(ticks_df, interval='1d', session='全盤'):
     rule = resample_rules.get(interval, '1D')
     
     # 重採樣為 K 棒
-    kbars = ticks_df.resample(rule).agg({
+    # 券商常見以「右標籤」顯示（例如 15:05 代表 15:01~15:05），因此 5m/15m/30m/60m 採用 right/right。
+    resample_kwargs = {}
+    if rule != '1D':
+        resample_kwargs = {'label': 'right', 'closed': 'right'}
+
+    kbars = ticks_df.resample(rule, **resample_kwargs).agg({
         'open': 'first',
         'high': 'max',
         'low': 'min',

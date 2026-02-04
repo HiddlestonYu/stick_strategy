@@ -20,7 +20,13 @@ import pytz  # 時區處理庫，用於處理不同時區的時間
 import time  # 時間處理，用於自動刷新
 import pickle  # 序列化工具，用於資料快取
 import os  # 檔案系統操作
-from tick_database import get_kbars_from_db, save_tick, init_database  # Ticks database 模組
+from tick_database import (
+    get_kbars_from_db,
+    save_tick,
+    save_ticks_batch,
+    init_database,
+    get_latest_tick_timestamp,
+)  # Ticks database 模組
 
 # ============================================================
 # 1. 頁面初始化設定與 Shioaji 連線
@@ -355,20 +361,13 @@ with st.sidebar:
     # 全盤：顯示所有交易時段
     # 日盤：08:45 - 13:45
     # 夜盤：15:00 - 次日 05:00
-    # 注意：日K強制使用日盤時段
-    
-    if interval_option == "1d":
-        # 日K固定顯示日盤
-        session_option = "日盤"
-        st.info("💡 日K固定顯示日盤時段（08:45-13:45）")
-    else:
-        # 其他週期可選擇時段
-        default_session_index = 0  # 預設日盤
-        session_option = st.selectbox(
-            "選擇時段",
-            ("日盤", "夜盤", "全盤"),
-            index=default_session_index
-        )
+    # 預設日盤，並提供 全盤/日盤/夜盤 選項
+    default_session_index = 0  # 預設日盤
+    session_option = st.selectbox(
+        "選擇時段",
+        ("日盤", "夜盤", "全盤"),
+        index=default_session_index
+    )
     
     # ------------------------------------------------------------
     # 3.5 最大K棒數量滑桿
@@ -539,7 +538,8 @@ def filter_by_session(df, session, interval):
     elif session == "夜盤":
         # 夜盤時段：15:00 - 次日 05:00
         # 包含 15 點之後到 5 點之前（跨日）
-        mask = (hours >= 15) | (hours < 5)
+        # 注意：只包含 05:00 這一根，不包含 05:01~05:59
+        mask = (hours >= 15) | (hours < 5) | ((hours == 5) & (minutes == 0))
         return df[mask]
     else:
         # 返回所有資料不過濾
@@ -638,7 +638,7 @@ def merge_data(old_df, new_df):
     
     return combined
 
-def get_data_from_shioaji(_api, interval, product, session):
+def get_data_from_shioaji(_api, interval, product, session, max_kbars):
     """
     從 Ticks Database 獲取 K 線數據（新架構）
     
@@ -661,16 +661,115 @@ def get_data_from_shioaji(_api, interval, product, session):
         
         # 初始化 database
         init_database()
+
+        # ------------------------------------------------------------
+        # 每日自動更新機制（若今日資料不存在或過舊）
+        # ------------------------------------------------------------
+        def update_today_kbars_if_needed(api_instance):
+            try:
+                if api_instance is None:
+                    return
+                
+                taipei_tz = pytz.timezone('Asia/Taipei')
+                now = datetime.now(taipei_tz)
+                today = now.date()
+                
+                # 週末白天不抓取；但週末凌晨允許補齊夜盤（例如週五夜盤到週六 05:00）
+                if today.weekday() >= 5 and now.hour >= 6:
+                    return
+                
+                # 檢查今日是否已有資料
+                latest_ts = get_latest_tick_timestamp(code='TXFR1', date=today)
+                market_status_text, market_is_open, _ = get_market_status()
+                
+                need_update = latest_ts is None
+                if not need_update and market_is_open:
+                    # 開盤中若資料超過 2 分鐘未更新則重新抓取
+                    if latest_ts < now - timedelta(minutes=2):
+                        need_update = True
+                
+                if not need_update:
+                    return
+                
+                st.sidebar.info("🔄 偵測到今日資料缺失或過舊，開始更新...")
+                
+                contract = api_instance.Contracts.Futures.TXF.TXFR1
+                start = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+                end = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+                
+                kbars = api_instance.kbars(contract=contract, start=start, end=end)
+                if kbars is None:
+                    st.sidebar.warning("⚠️ 今日數據抓取失敗")
+                    return
+                
+                df = pd.DataFrame({**kbars})
+                if df.empty:
+                    st.sidebar.warning("⚠️ 今日數據為空")
+                    return
+                
+                df["ts"] = pd.to_datetime(df["ts"])
+                df = df.rename(columns={"ts": "datetime"}).sort_values("datetime").reset_index(drop=True)
+                df = df.set_index("datetime").sort_index()
+                df = df[df.index.date == today]
+                
+                if df.empty:
+                    st.sidebar.warning("⚠️ 今日數據過濾後為空")
+                    return
+                
+                batch_ticks = []
+                for idx, row in df.iterrows():
+                    if idx.tzinfo is None:
+                        idx = taipei_tz.localize(idx)
+                    else:
+                        idx = idx.tz_convert(taipei_tz)
+                    
+                    tick_data = {
+                        'ts': idx,
+                        'code': contract.code,
+                        'open': row.get('Open', row.get('Close', 0)),
+                        'high': row.get('High', row.get('Close', 0)),
+                        'low': row.get('Low', row.get('Close', 0)),
+                        'close': row.get('Close', 0),
+                        'volume': row.get('Volume', 0),
+                        'bid_price': row.get('Close', 0),
+                        'ask_price': row.get('Close', 0),
+                        'bid_volume': 0,
+                        'ask_volume': 0,
+                    }
+                    batch_ticks.append(tick_data)
+                
+                save_ticks_batch(batch_ticks)
+                st.sidebar.success(f"✅ 今日數據已更新：{len(batch_ticks)} 筆")
+            except Exception as e:
+                st.sidebar.warning(f"⚠️ 自動更新失敗: {str(e)}")
         
-        # 根據 interval 決定回溯天數
-        if interval == "1d":
-            days = 60  # 日K回溯60天
-        elif interval in ["30m", "60m"]:
-            days = 7   # 30分/60分K回溯7天
-        elif interval == "15m":
-            days = 5   # 15分K回溯5天
-        else:
-            days = 5   # 1分/5分K回溯5天（修正：原本1天讀不到資料）
+        update_today_kbars_if_needed(_api)
+
+        # ------------------------------------------------------------
+        # 根據「K棒數量 + 週期 + 時段」自動估算回溯天數
+        # 目標：讓滑桿增加時，能自動帶出更多歷史資料
+        # ------------------------------------------------------------
+        def estimate_lookback_days(interval_value, session_value, kbars_needed):
+            # 日K：每個交易日 1 根，估算需包含週末緩衝
+            if interval_value == "1d":
+                return min(max(int(kbars_needed * 7 / 5) + 10, 30), 365)
+
+            # 估算每個交易日可產生的 K 根數（粗估，足夠用於回溯天數）
+            bars_per_day = {
+                "1m": {"日盤": 300, "夜盤": 840, "全盤": 1140},
+                "5m": {"日盤": 60, "夜盤": 168, "全盤": 228},
+                "15m": {"日盤": 20, "夜盤": 56, "全盤": 76},
+                "30m": {"日盤": 10, "夜盤": 28, "全盤": 38},
+                "60m": {"日盤": 5, "夜盤": 14, "全盤": 19},
+            }
+
+            per_day = bars_per_day.get(interval_value, {}).get(session_value, 60)
+            # 額外 +2 天緩衝，避免遇到週末或資料缺口
+            days_needed = int((kbars_needed + per_day - 1) / per_day) + 2
+            return min(max(days_needed, 3), 90)
+
+        days = estimate_lookback_days(interval, session, max_kbars)
+        st.sidebar.caption(f"📅 回溯天數: {days} 天（依 K棒數自動調整）")
         
         # 從 database 讀取並組成 K 棒
         df = get_kbars_from_db(interval=interval, session=session, days=days)
@@ -1123,7 +1222,7 @@ def process_kline_data(df, interval, session):
     return df
 
 # 主要數據獲取函數
-def get_data(interval, product, session, use_shioaji=False, api_instance=None):
+def get_data(interval, product, session, max_kbars, use_shioaji=False, api_instance=None):
     """
     統一的數據獲取接口，具備容錯機制
     
@@ -1147,7 +1246,7 @@ def get_data(interval, product, session, use_shioaji=False, api_instance=None):
     # 僅使用 Shioaji TXF
     if use_shioaji and api_instance is not None:
         st.sidebar.info("🔄 使用 Shioaji API 獲取 TXF 數據...")
-        df = get_data_from_shioaji(api_instance, interval, product, session)
+        df = get_data_from_shioaji(api_instance, interval, product, session, max_kbars)
         
         if df is not None and not df.empty:
             data_source = "Shioaji (TXF)"
@@ -1192,9 +1291,9 @@ except:
 # 取得資料時傳遞 API 實例
 if use_shioaji_flag:
     api_instance = st.session_state['shioaji_api']
-    df, data_source, is_realtime = get_data(interval_option, product_option, session_option, use_shioaji_flag, api_instance)
+    df, data_source, is_realtime = get_data(interval_option, product_option, session_option, max_kbars, use_shioaji_flag, api_instance)
 else:
-    df, data_source, is_realtime = get_data(interval_option, product_option, session_option, use_shioaji_flag)
+    df, data_source, is_realtime = get_data(interval_option, product_option, session_option, max_kbars, use_shioaji_flag)
 
 # 顯示數據來源和數據量資訊
 if df is not None and not df.empty:
