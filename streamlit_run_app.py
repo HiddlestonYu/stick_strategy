@@ -673,20 +673,48 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                 taipei_tz = pytz.timezone('Asia/Taipei')
                 now = datetime.now(taipei_tz)
                 today = now.date()
+
+                # 夜盤判斷：15:00~隔日05:00（凌晨 00:00~05:00 的夜盤歸屬前一個交易日）
+                is_night_time = (now.hour >= 15) or (now.hour < 6)
+                night_trade_date = today if now.hour >= 15 else (today - timedelta(days=1))
+                next_date = night_trade_date + timedelta(days=1)
                 
                 # 週末白天不抓取；但週末凌晨允許補齊夜盤（例如週五夜盤到週六 05:00）
                 if today.weekday() >= 5 and now.hour >= 6:
                     return
                 
-                # 檢查今日是否已有資料
-                latest_ts = get_latest_tick_timestamp(code='TXFR1', date=today)
+                # 檢查資料是否已有/是否過舊
                 market_status_text, market_is_open, _ = get_market_status()
-                
-                need_update = latest_ts is None
-                if not need_update and market_is_open:
-                    # 開盤中若資料超過 2 分鐘未更新則重新抓取
-                    if latest_ts < now - timedelta(minutes=2):
-                        need_update = True
+
+                # 夜盤 / 全盤：以「夜盤交易日」判斷是否缺少 15:00~23:59 的資料，並以跨日區間的最新時間判斷是否過舊
+                if session in ("夜盤", "全盤") and is_night_time:
+                    latest_trade_date_ts = get_latest_tick_timestamp(code='TXFR1', date=night_trade_date)
+                    latest_next_date_ts = get_latest_tick_timestamp(code='TXFR1', date=next_date)
+                    latest_in_session = None
+                    for t in (latest_trade_date_ts, latest_next_date_ts):
+                        if t is not None:
+                            latest_in_session = t if latest_in_session is None else max(latest_in_session, t)
+
+                    missing_evening = (
+                        latest_trade_date_ts is None or
+                        (latest_trade_date_ts.hour < 15)
+                    )
+
+                    too_old = False
+                    if market_is_open and latest_in_session is not None:
+                        too_old = latest_in_session < now - timedelta(minutes=2)
+                    if market_is_open and latest_in_session is None:
+                        too_old = True
+
+                    need_update = missing_evening or too_old
+                else:
+                    # 日盤：沿用「今日」判斷
+                    latest_ts = get_latest_tick_timestamp(code='TXFR1', date=today)
+                    need_update = latest_ts is None
+                    if not need_update and market_is_open:
+                        # 開盤中若資料超過 2 分鐘未更新則重新抓取
+                        if latest_ts < now - timedelta(minutes=2):
+                            need_update = True
                 
                 if not need_update:
                     return
@@ -694,8 +722,11 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                 st.sidebar.info("🔄 偵測到今日資料缺失或過舊，開始更新...")
                 
                 contract = api_instance.Contracts.Futures.TXF.TXFR1
-                start = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-                end = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+                # 抓取範圍：依夜盤交易日抓取 ±1 天（可涵蓋 15:00~隔日05:00）
+                base_date = night_trade_date if (session in ("夜盤", "全盤") and is_night_time) else today
+                start = (base_date - timedelta(days=1)).strftime("%Y-%m-%d")
+                end = (base_date + timedelta(days=1)).strftime("%Y-%m-%d")
                 
                 kbars = api_instance.kbars(contract=contract, start=start, end=end)
                 if kbars is None:
@@ -710,7 +741,23 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                 df["ts"] = pd.to_datetime(df["ts"])
                 df = df.rename(columns={"ts": "datetime"}).sort_values("datetime").reset_index(drop=True)
                 df = df.set_index("datetime").sort_index()
-                df = df[df.index.date == today]
+
+                # 過濾要保存的區間：
+                # - 夜盤/全盤且在夜盤時間：保存 night_trade_date 15:00~23:59 + 隔日 00:00~05:00(含)
+                # - 其他情況：保存今日資料
+                if session in ("夜盤", "全盤") and is_night_time:
+                    df = df[
+                        ((df.index.date == night_trade_date) & (df.index.hour >= 15)) |
+                        (
+                            (df.index.date == next_date) &
+                            (
+                                (df.index.hour < 5) |
+                                ((df.index.hour == 5) & (df.index.minute == 0))
+                            )
+                        )
+                    ]
+                else:
+                    df = df[df.index.date == today]
                 
                 if df.empty:
                     st.sidebar.warning("⚠️ 今日數據過濾後為空")
