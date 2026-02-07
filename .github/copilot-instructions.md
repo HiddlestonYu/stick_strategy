@@ -71,7 +71,9 @@
 
 ### Git 操作
 - **絕對不要自動執行 `git commit` 或 `git push`**
-- 必須先詢問使用者意願
+- 僅在「使用者於同一則訊息中明確要求」(例如："請幫我 git commit"、"請 push") 時才允許執行
+- **不得**因為先前對話曾經授權就推定這次也能 commit/push（每次都需要本次訊息明確授權）
+- 即使使用者已要求 commit/push，仍需先回覆確認：將提交的檔案清單 + commit message，再開始執行
 - Commit message 使用繁體中文
 - 不要提交敏感檔案（.pfx, .env, .log）
 
