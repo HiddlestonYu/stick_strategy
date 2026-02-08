@@ -231,17 +231,35 @@ with st.sidebar:
                 use_cert = True
             else:
                 st.info("💡 請至永豐證券網站申請 API Key: https://www.sinotrade.com.tw/")
-                st.caption("🔐 建議用環境變數設定：SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY（避免把金鑰寫進程式）")
+                st.caption("🔐 建議用環境變數或 Streamlit secrets 設定：SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY（避免把金鑰寫進程式）")
+
+                default_api_key = ""
+                default_secret_key = ""
+                try:
+                    default_api_key = (
+                        st.secrets.get("SHIOAJI_API_KEY", "")
+                        or st.secrets.get("shioaji", {}).get("api_key", "")
+                    )
+                    default_secret_key = (
+                        st.secrets.get("SHIOAJI_SECRET_KEY", "")
+                        or st.secrets.get("shioaji", {}).get("secret_key", "")
+                    )
+                except Exception:
+                    default_api_key = ""
+                    default_secret_key = ""
+
+                default_api_key = default_api_key or os.getenv("SHIOAJI_API_KEY", "")
+                default_secret_key = default_secret_key or os.getenv("SHIOAJI_SECRET_KEY", "")
                 api_key = st.text_input(
                     "API Key",
                     type="password",
-                    value=os.getenv("SHIOAJI_API_KEY", ""),
+                    value=default_api_key,
                     help="永豐證券提供的 API Key",
                 )
                 secret_key = st.text_input(
                     "Secret Key",
                     type="password",
-                    value=os.getenv("SHIOAJI_SECRET_KEY", ""),
+                    value=default_secret_key,
                     help="永豐證券提供的 Secret Key",
                 )
                 use_cert = False

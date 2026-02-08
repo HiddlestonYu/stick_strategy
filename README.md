@@ -124,6 +124,10 @@ $Env:SHIOAJI_SECRET_KEY="你的SECRET_KEY"
 
 （請勿把金鑰寫進程式或提交到 Git）
 
+另外也可使用 Streamlit secrets（本機檔案、不提交）：
+1) 複製 `.streamlit/secrets.toml.example` → `.streamlit/secrets.toml`
+2) 填入你的 `SHIOAJI_API_KEY` / `SHIOAJI_SECRET_KEY`
+
 4. **初始化數據庫**
 ```bash
 python fetch_kbars_improved.py  # 抓取歷史數據

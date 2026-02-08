@@ -16,7 +16,8 @@ env/
 ENV/
 
 # Streamlit
-.streamlit/
+.streamlit/*
+!.streamlit/secrets.toml.example
 
 # IDE
 .vscode/
