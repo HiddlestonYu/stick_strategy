@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
+import os
 import shioaji as sj
 from tick_database import save_ticks_batch
 import pytz
@@ -14,9 +15,13 @@ import pytz
 # ============================================================
 print("登入 Shioaji...")
 api = sj.Shioaji()
+api_key = os.getenv("SHIOAJI_API_KEY")
+secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+if not api_key or not secret_key:
+    raise RuntimeError("缺少 Shioaji 憑證：請設定環境變數 SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY 再執行")
 api.login(
-    api_key="F97Uvg5MtkHWLzPzueMkxYYgZwo8h18Qsk6Y3Ah6BBox",
-    secret_key="5a1Uenx7KtJN1CxxHC34MDJgHN67ePysroAPGmzTv1zG"
+    api_key=api_key,
+    secret_key=secret_key,
 )
 print("[OK] 登入成功\n")
 

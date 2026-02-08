@@ -45,7 +45,7 @@
 ### 📊 K 線週期選擇
 - **1m**：1 分鐘 K 線（直接讀取數據庫）
 - **5m/15m/30m/60m**：多分鐘 K 線（由 1 分 K 重組）
-- **1d（日 K，預設）**：日線，自動強制顯示日盤時段
+- **1d（日 K，預設）**：日線，依「交易時段」彙總（日盤/夜盤/全盤）
 
 ### 🔄 自動刷新機制
 - **即時模式**：市場開盤時啟用自動刷新
@@ -114,7 +114,17 @@ venv_new\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
-3. **初始化數據庫**
+3. **設定 Shioaji 憑證（建議用環境變數）**
+
+Windows PowerShell：
+```powershell
+$Env:SHIOAJI_API_KEY="你的API_KEY"
+$Env:SHIOAJI_SECRET_KEY="你的SECRET_KEY"
+```
+
+（請勿把金鑰寫進程式或提交到 Git）
+
+4. **初始化數據庫**
 ```bash
 python fetch_kbars_improved.py  # 抓取歷史數據
 ```
@@ -129,12 +139,15 @@ streamlit run streamlit_run_app.py
 
 ### Shioaji API 設定
 
-**在側邊欄輸入永豐證券 API 資訊：**
-- API Key
-- API Secret
-- 點擊「登入 Shioaji」
+**在側邊欄登入 Shioaji（兩種方式擇一）：**
+- 直接在側邊欄輸入 API Key / API Secret
+- 或先設定環境變數 `SHIOAJI_API_KEY` / `SHIOAJI_SECRET_KEY`（較安全）
 
 **注意**：需先至永豐證券官網申請 API 使用權限
+
+### DB 優先顯示（未登入也可看）
+- App 會優先顯示本機 `data/txf_ticks.db` 的資料；即使未登入 Shioaji，也能查看既有 K 線。
+- 登入 Shioaji 後才會啟用「自動更新」與「日 K 不足自動回填」。
 
 ## 📊 核心功能說明
 
@@ -154,9 +167,11 @@ elif session == '夜盤':
 ```python
 # settlement_utils.py
 def is_settlement_day(date):
-    # 第三個星期三：weekday()==2 AND 15<=day<=21
-    return date.weekday() == 2 and 15 <= date.day <= 21
+  # 以「每月第三個週三」為基準；若遇非工作日，順延至下一個工作日
+  ...
 ```
+
+（本專案使用 `holidays` 近似判斷台灣工作日，用於結算日順延與日盤收盤時間 13:30/13:45。）
 
 ### 數據驗證狀態
 所有 OHLC 數據已與券商 APP 交叉驗證：
@@ -172,6 +187,7 @@ stick_strategy/
 ├── tick_database.py           # 數據庫管理模組
 ├── settlement_utils.py        # 結算日工具
 ├── fetch_kbars_improved.py    # 歷史數據抓取
+├── backfill_kbars.py          # 批次回填（可補近 N 個交易日）
 ├── requirements.txt           # Python 依賴
 ├── data/
 │   └── txf_ticks.db          # SQLite 數據庫（1 分 K）
@@ -187,7 +203,7 @@ stick_strategy/
 
 ### 2. 選擇查詢條件
 - **K 線週期**：1m / 5m / 15m / 30m / 60m / 1d
-- **交易時段**：全盤 / 日盤 / 夜盤（日 K 固定顯示日盤）
+- **交易時段**：全盤 / 日盤 / 夜盤（日 K 會依所選時段彙總）
 - **刷新間隔**：1-60 秒（市場開盤時自動刷新）
 
 ### 3. 查看圖表
@@ -212,6 +228,11 @@ stick_strategy/
 - 重新抓取歷史數據：`python fetch_kbars_improved.py`
 - 檢查結算日處理是否正確
 - 查看數據庫 `data/txf_ticks.db` 是否完整
+
+### 「顯示 K 棒數量拉很大，但圖上根數不變」
+- 常見原因是：該「交易時段 + 週期（尤其是日 K 的夜盤/全盤）」在 DB 裡的存量不足。
+- 側邊欄會顯示「DB 日K存量」與日期範圍；若不足，登入 Shioaji 後會自動分批回填。
+- 也可以手動回填：`python backfill_kbars.py --days 500 --session 全盤`
 
 ## 📝 開發記錄
 
@@ -242,7 +263,7 @@ Hiddleston @ 2026
 
 ---
 
-**最後更新**: 2026-02-04  
+**最後更新**: 2026-02-08  
 **數據範圍**: 2026-01-01 ~ 2026-02-04 (23 交易日)  
 **數據庫記錄**: 24,338 筆 1 分 K  
 **驗證狀態**: ✅ 所有數據與券商 APP 一致

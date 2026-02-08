@@ -2,6 +2,7 @@
 從 Shioaji API 抓取真實的歷史 ticks 並存入資料庫
 """
 import shioaji as sj
+import os
 from datetime import datetime, timedelta
 import pytz
 from pathlib import Path
@@ -19,9 +20,13 @@ cert_path = Path.home() / "OneDrive" / "文件" / "Python" / "Sinopac.pfx"
 print("登入 Shioaji...")
 try:
     # 使用 API Key 登入
+    api_key = os.getenv("SHIOAJI_API_KEY")
+    secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+    if not api_key or not secret_key:
+        raise RuntimeError("缺少 Shioaji 憑證：請設定環境變數 SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY")
     accounts = api.login(
-        api_key="F97Uvg5MtkHWLzPzueMkxYYgZwo8h18Qsk6Y3Ah6BBox",
-        secret_key="5a1Uenx7KtJN1CxxHC34MDJgHN67ePysroAPGmzTv1zG",
+        api_key=api_key,
+        secret_key=secret_key,
         contracts_timeout=10000,
         contracts_cb=lambda security_type: print(f"[{security_type}] 合約下載完成")
     )
