@@ -4,7 +4,7 @@
 
 這是一個基於 Streamlit 開發的台指期貨即時看盤系統，採用 **Shioaji API + SQLite Database** 架構，提供精確的 K 線圖表、技術指標分析和多時段交易視圖。所有數據經過嚴格驗證，確保與券商看盤軟體完全一致。
 
-**主要程式**: `streamlit_run_app.py`
+**主要程式**: `stock_city/app/streamlit_run_app.py`
 
 **專案流程圖（Phase 1~3）**：請見 [docs/PROJECT_FLOW.md](docs/PROJECT_FLOW.md)
 
@@ -28,7 +28,7 @@
   - 智能結算日處理（第三週三 13:30 收盤）
 
 ### 📅 結算日智能處理
-- **自動偵測**：`settlement_utils.py` 判斷每月第三個星期三
+- **自動偵測**：`stock_city/market/settlement_utils.py` 判斷每月第三個星期三
 - **動態收盤時間**：
   - 一般日盤：08:45 - **13:45**
   - 結算日盤：08:45 - **13:30**（提前 15 分鐘）
@@ -69,21 +69,21 @@
 
 ### 💾 核心模組
 
-**streamlit_run_app.py** - 主程式
+**stock_city/app/streamlit_run_app.py** - 主程式
 - Streamlit Web 介面
 - 數據查詢與圖表渲染
 - 時段篩選與 K 線重組
 
-**tick_database.py** - 數據庫管理
+**stock_city/db/tick_database.py** - 數據庫管理
 - SQLite CRUD 操作
 - Tick 數據讀取與批次寫入
 - K 線重組邏輯（含結算日處理）
 
-**settlement_utils.py** - 結算日工具
+**stock_city/market/settlement_utils.py** - 結算日工具
 - 判斷每月第三個星期三
 - 動態回傳日盤收盤時間（13:30/13:45）
 
-**fetch_kbars_improved.py** - 歷史數據抓取
+**stock_city/scripts/fetch_kbars_improved.py** - 歷史數據抓取
 - 使用 Shioaji `api.kbars()` 取得 1 分 K
 - ±1 天查詢法確保數據完整
 - 自動偵測並標記結算日
@@ -132,13 +132,13 @@ $Env:SHIOAJI_SECRET_KEY="你的SECRET_KEY"
 
 4. **初始化數據庫**
 ```bash
-python fetch_kbars_improved.py  # 抓取歷史數據
+python -m stock_city.scripts.fetch_kbars_improved  # 抓取歷史數據
 ```
 
 ### 執行應用程式
 
 ```bash
-streamlit run streamlit_run_app.py
+streamlit run stock_city/app/streamlit_run_app.py
 ```
 
 應用程式會在瀏覽器自動開啟：http://localhost:8501
@@ -160,7 +160,7 @@ streamlit run streamlit_run_app.py
 ### K 線重組邏輯
 數據庫儲存 1 分 K，所有其他週期由 `resample_ticks_to_kbars()` 動態重組：
 ```python
-# tick_database.py
+# stock_city/db/tick_database.py
 if session == '日盤':
     for date in pd.unique(dates):
         end_minute = 30 if is_settlement_day(date) else 45
@@ -171,7 +171,7 @@ elif session == '夜盤':
 
 ### 結算日偵測
 ```python
-# settlement_utils.py
+# stock_city/market/settlement_utils.py
 def is_settlement_day(date):
   # 以「每月第三個週三」為基準；若遇非工作日，順延至下一個工作日
   ...
@@ -187,17 +187,33 @@ def is_settlement_day(date):
 
 ## 📂 專案結構
 
+### 為什麼要這樣分層？
+- **核心邏輯集中**：把資料庫與交易日工具放進 `stock_city/`，Phase 2/3 加策略與回測時不會把根目錄越堆越亂。
+- **DB 路徑固定**：所有模組統一透過 `stock_city/project_paths.py` 取得 `data/txf_ticks.db`，避免檔案搬移後路徑跟著變。
+- **腳本一致執行方式**：建議用 `python -m stock_city.scripts.<script>`，可確保 import 穩定。
+
 ```
 stick_strategy/
-├── streamlit_run_app.py       # 主程式（Streamlit UI）
-├── tick_database.py           # 數據庫管理模組
-├── settlement_utils.py        # 結算日工具
-├── fetch_kbars_improved.py    # 歷史數據抓取
-├── backfill_kbars.py          # 批次回填（可補近 N 個交易日）
-├── requirements.txt           # Python 依賴
+├── stock_city/
+│   ├── project_paths.py           # 專案根目錄/DB 路徑集中管理
+│   ├── app/
+│   │   └── streamlit_run_app.py   # Streamlit UI 入口
+│   ├── db/
+│   │   └── tick_database.py       # SQLite + K 線重組核心
+│   ├── market/
+│   │   └── settlement_utils.py    # 結算日與工作日工具
+│   └── scripts/
+│       ├── fetch_kbars_improved.py
+│       ├── backfill_kbars.py
+│       ├── fetch_full_data.py
+│       ├── fetch_real_ticks.py
+│       └── realtime_ticks_subscriber.py
+├── experiments/                  # 一次性驗證/研究用（不影響正式流程）
 ├── data/
-│   └── txf_ticks.db          # SQLite 數據庫（1 分 K）
-└── README.md                 # 本文件
+│   └── txf_ticks.db              # SQLite 數據庫（1 分 K）
+├── docs/
+├── requirements.txt
+└── README.md
 ```
 
 ## 🔍 使用說明
@@ -231,14 +247,14 @@ stick_strategy/
 4. 嘗試「強制重置」並重新登入
 
 ### 數據不一致
-- 重新抓取歷史數據：`python fetch_kbars_improved.py`
+- 重新抓取歷史數據：`python -m stock_city.scripts.fetch_kbars_improved`
 - 檢查結算日處理是否正確
 - 查看數據庫 `data/txf_ticks.db` 是否完整
 
 ### 「顯示 K 棒數量拉很大，但圖上根數不變」
 - 常見原因是：該「交易時段 + 週期（尤其是日 K 的夜盤/全盤）」在 DB 裡的存量不足。
 - 側邊欄會顯示「DB 日K存量」與日期範圍；若不足，登入 Shioaji 後會自動分批回填。
-- 也可以手動回填：`python backfill_kbars.py --days 500 --session 全盤`
+- 也可以手動回填：`python -m stock_city.scripts.backfill_kbars --days 500 --session 全盤`
 
 ## 📝 開發記錄
 

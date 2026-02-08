@@ -10,14 +10,14 @@ import argparse
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import pandas as pd
 import pytz
 import shioaji as sj
 
-from settlement_utils import get_day_session_end_time, is_settlement_day
-from tick_database import save_ticks_batch
+from stock_city.market.settlement_utils import get_day_session_end_time, is_settlement_day
+from stock_city.db.tick_database import save_ticks_batch
+from stock_city.project_paths import get_db_path
 
 
 def parse_args():
@@ -74,7 +74,7 @@ def main():
         print(f"  - {d}")
     print()
 
-    db_path = Path(__file__).parent / "data" / "txf_ticks.db"
+    db_path = get_db_path()
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
     for date in dates_to_fetch:

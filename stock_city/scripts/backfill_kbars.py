@@ -27,19 +27,19 @@ from dataclasses import dataclass
 from datetime import date as date_type
 from datetime import datetime, timedelta
 import os
-from pathlib import Path
 
 import pandas as pd
 import pytz
 import shioaji as sj
 
-from settlement_utils import get_day_session_end_time, is_workday
-from tick_database import save_ticks_batch
+from stock_city.market.settlement_utils import get_day_session_end_time, is_workday
+from stock_city.db.tick_database import save_ticks_batch
+from stock_city.project_paths import get_db_path
 
 
 TAIPEI_TZ = pytz.timezone("Asia/Taipei")
 UTC_TZ = pytz.UTC
-DB_PATH = Path(__file__).parent / "data" / "txf_ticks.db"
+DB_PATH = get_db_path()
 
 
 @dataclass(frozen=True)

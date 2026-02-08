@@ -20,13 +20,15 @@ import pytz  # 時區處理庫，用於處理不同時區的時間
 import time  # 時間處理，用於自動刷新
 import pickle  # 序列化工具，用於資料快取
 import os  # 檔案系統操作
-from tick_database import (
+from stock_city.db.tick_database import (
     get_kbars_from_db,
     save_tick,
     save_ticks_batch,
     init_database,
     get_latest_tick_timestamp,
 )  # Ticks database 模組
+
+from stock_city.project_paths import get_db_path
 
 # ============================================================
 # 1. 頁面初始化設定與 Shioaji 連線
@@ -214,7 +216,7 @@ with st.sidebar:
         
         # 重要提示
         if use_shioaji:
-            st.info("💡 **Shioaji 多合約拼接功能**\n- 自動拼接所有可用期貨合約數據\n- 獲得與 Yahoo Finance 類似的完整歷史數據\n- 首次載入可能需要較長時間")
+            st.info("💡 **Shioaji 多合約拼接功能**\n- 自動拼接所有可用期貨合約數據\n- 首次載入可能需要較長時間")
         
         if use_shioaji:
             # 登入方式選擇
@@ -586,15 +588,15 @@ def get_contract(api, product):
 
 def get_ticker_symbol(product):
     """
-    根據使用者選擇的商品返回對應的 Yahoo Finance 股票代碼（備用）
+    根據使用者選擇的商品返回對應代碼（已廢棄）
     
     參數:
         product (str): 使用者選擇的商品名稱（已廢棄）
         
     返回:
-        str: 已移除 Yahoo Finance 支援
+        str: 已移除
     """
-    return None  # Yahoo Finance 已移除
+    return None
 
 def filter_by_session(df, session, interval):
     """
@@ -978,15 +980,13 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                 else:
                     cursor_date = datetime.now(taipei_tz).date()
 
-                from settlement_utils import is_workday
+                from stock_city.market.settlement_utils import is_workday
 
                 # 用 DB 粗判斷該日是否已有足夠資料（避免重抓）
                 def has_sufficient_data_local(d, sess):
                     try:
                         import sqlite3
-                        from pathlib import Path
-
-                        db_path = Path(__file__).parent / "data" / "txf_ticks.db"
+                        db_path = get_db_path()
                         conn = sqlite3.connect(str(db_path))
                         cur = conn.cursor()
 
@@ -1023,9 +1023,7 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                 def delete_window_local(d, sess):
                     try:
                         import sqlite3
-                        from pathlib import Path
-
-                        db_path = Path(__file__).parent / "data" / "txf_ticks.db"
+                        db_path = get_db_path()
                         conn = sqlite3.connect(str(db_path))
                         cur = conn.cursor()
 
@@ -1212,8 +1210,7 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
             # 顯示詳細調試信息
             try:
                 import sqlite3
-                from pathlib import Path
-                db_path = Path(__file__).parent / "data" / "txf_ticks.db"
+                db_path = get_db_path()
                 conn = sqlite3.connect(str(db_path))
                 cursor = conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM ticks")
@@ -1624,7 +1621,7 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
 
 @st.cache_data(ttl=60)
 # ============================================================
-# Yahoo Finance 相關函數已移除，改用純 Shioaji TXF 架構
+# 備援資料源相關函數已移除，改用純 Shioaji TXF 架構
 # ============================================================
 
 def process_kline_data(df, interval, session):

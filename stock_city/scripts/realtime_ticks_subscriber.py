@@ -5,8 +5,7 @@ import shioaji as sj
 import os
 from datetime import datetime
 import pytz
-from pathlib import Path
-from tick_database import save_tick, init_database
+from stock_city.db.tick_database import save_tick, init_database
 import time
 
 # 初始化資料庫

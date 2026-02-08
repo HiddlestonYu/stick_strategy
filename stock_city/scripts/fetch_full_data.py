@@ -1,13 +1,11 @@
 """
 抓取 2026-01-01 到 2026-02-04 的數據
 """
-import sqlite3
-from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
 import os
 import shioaji as sj
-from tick_database import save_ticks_batch
+from stock_city.db.tick_database import save_ticks_batch
 import pytz
 
 # ============================================================

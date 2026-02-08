@@ -11,10 +11,11 @@ import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
-from pathlib import Path
 
-# Database 路徑
-DB_PATH = Path(__file__).parent / "data" / "txf_ticks.db"
+from stock_city.project_paths import get_db_path
+
+# Database 路徑（固定指向專案根目錄 /data，避免模組搬移導致路徑改變）
+DB_PATH = get_db_path()
 
 def init_database():
     """初始化 ticks database"""
@@ -284,7 +285,7 @@ def resample_ticks_to_kbars(ticks_df, interval='1d', session='全盤'):
         
         if session == "日盤":
             # 導入結算日判斷
-            from settlement_utils import is_settlement_day
+            from stock_city.market.settlement_utils import is_settlement_day
             
             # 日盤：08:45 - 13:45（一般日）或 08:45 - 13:30（結算日）
             # 需要逐日判斷收盤時間
@@ -331,7 +332,7 @@ def resample_ticks_to_kbars(ticks_df, interval='1d', session='全盤'):
         night_mask = (hours >= 15) | (hours < 5) | ((hours == 5) & (minutes == 0))
 
         # 日盤時間：08:45 - 13:45（一般日）或 08:45 - 13:30（結算日）
-        from settlement_utils import is_settlement_day
+        from stock_city.market.settlement_utils import is_settlement_day
         day_mask = pd.Series(False, index=df.index)
         dates = trade_date.values
         for d in pd.unique(dates):

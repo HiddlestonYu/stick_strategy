@@ -8,7 +8,8 @@ import pytz
 from pathlib import Path
 import time
 import pandas as pd
-from tick_database import save_ticks_batch, init_database
+from stock_city.db.tick_database import save_ticks_batch, init_database
+from stock_city.project_paths import get_db_path
 
 # 初始化資料庫
 init_database()
@@ -51,7 +52,7 @@ taipei_tz = pytz.timezone('Asia/Taipei')
 # 清除舊的假數據
 print("清除資料庫中的舊數據...")
 import sqlite3
-conn = sqlite3.connect(str(Path(__file__).parent / "data" / "txf_ticks.db"), timeout=10)
+conn = sqlite3.connect(str(get_db_path()), timeout=10)
 cursor = conn.cursor()
 cursor.execute("DELETE FROM ticks")
 conn.commit()
