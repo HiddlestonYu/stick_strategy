@@ -6,6 +6,8 @@
 
 **主要程式**: `streamlit_run_app.py`
 
+**專案流程圖（Phase 1~3）**：請見 [docs/PROJECT_FLOW.md](docs/PROJECT_FLOW.md)
+
 ### 🎯 核心特色
 - ✅ **數據準確性**：所有 OHLC 數據經驗證與券商 APP 完全一致
 - 🏦 **Shioaji API 整合**：直接連接永豐證券 API，取得最可靠的期貨數據
