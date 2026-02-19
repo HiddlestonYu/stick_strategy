@@ -10,6 +10,7 @@ import argparse
 import os
 import sqlite3
 from datetime import datetime, timedelta
+import tomllib
 
 import pandas as pd
 import pytz
@@ -17,7 +18,7 @@ import shioaji as sj
 
 from stock_city.market.settlement_utils import get_day_session_end_time, is_settlement_day
 from stock_city.db.tick_database import save_ticks_batch
-from stock_city.project_paths import get_db_path
+from stock_city.project_paths import get_db_path, get_project_root
 
 
 def parse_args():
@@ -34,11 +35,24 @@ def parse_args():
 def get_shioaji_credentials():
     api_key = os.getenv("SHIOAJI_API_KEY")
     secret_key = os.getenv("SHIOAJI_SECRET_KEY")
-    if not api_key or not secret_key:
-        raise RuntimeError(
-            "缺少 Shioaji 憑證：請設定環境變數 SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY 再執行"
-        )
-    return api_key, secret_key
+    if api_key and secret_key:
+        return api_key, secret_key
+
+    secrets_path = get_project_root() / ".streamlit" / "secrets.toml"
+    if secrets_path.exists():
+        try:
+            with open(secrets_path, "rb") as f:
+                secrets = tomllib.load(f)
+            s_api_key = secrets.get("SHIOAJI_API_KEY")
+            s_secret_key = secrets.get("SHIOAJI_SECRET_KEY")
+            if s_api_key and s_secret_key:
+                return str(s_api_key), str(s_secret_key)
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "缺少 Shioaji 憑證：請設定環境變數 SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY，或在 .streamlit/secrets.toml 設定同名欄位"
+    )
 
 
 def main():

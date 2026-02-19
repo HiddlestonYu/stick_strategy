@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from datetime import date as date_type
 from datetime import datetime, timedelta
 import os
+import tomllib
 
 import pandas as pd
 import pytz
@@ -34,7 +35,7 @@ import shioaji as sj
 
 from stock_city.market.settlement_utils import get_day_session_end_time, is_workday
 from stock_city.db.tick_database import save_ticks_batch
-from stock_city.project_paths import get_db_path
+from stock_city.project_paths import get_db_path, get_project_root
 
 
 TAIPEI_TZ = pytz.timezone("Asia/Taipei")
@@ -54,6 +55,13 @@ def parse_args():
         type=int,
         default=500,
         help="回填最近 N 個交易日（以週一~週五近似），預設 500",
+    )
+    parser.add_argument(
+        "--order",
+        type=str,
+        default="newest",
+        choices=["newest", "oldest"],
+        help="回補順序：newest=從最近日期開始（預設）；oldest=從最舊日期開始",
     )
     parser.add_argument(
         "--session",
@@ -87,6 +95,39 @@ def parse_args():
     return parser.parse_args()
 
 
+def _load_streamlit_secrets() -> dict:
+    """讀取 .streamlit/secrets.toml（若存在）。
+
+    注意：不得在 log 中印出 secrets 內容。
+    """
+    secrets_path = get_project_root() / ".streamlit" / "secrets.toml"
+    if not secrets_path.exists():
+        return {}
+    try:
+        with open(secrets_path, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
+def get_shioaji_credentials(api_key: str | None, secret_key: str | None) -> tuple[str | None, str | None]:
+    if api_key and secret_key:
+        return api_key, secret_key
+
+    env_api_key = os.getenv("SHIOAJI_API_KEY")
+    env_secret_key = os.getenv("SHIOAJI_SECRET_KEY")
+    if env_api_key and env_secret_key:
+        return env_api_key, env_secret_key
+
+    secrets = _load_streamlit_secrets()
+    secrets_api_key = secrets.get("SHIOAJI_API_KEY")
+    secrets_secret_key = secrets.get("SHIOAJI_SECRET_KEY")
+    if secrets_api_key and secrets_secret_key:
+        return str(secrets_api_key), str(secrets_secret_key)
+
+    return None, None
+
+
 def iter_recent_weekdays(end_date: date_type, count: int) -> list[date_type]:
     """往回找最近 count 個工作日。
 
@@ -115,10 +156,14 @@ def delete_existing_for_date(target_date: date_type, session: str):
     if session == "日盤":
         start_local = TAIPEI_TZ.localize(datetime(target_date.year, target_date.month, target_date.day, 8, 30, 0))
         end_local = TAIPEI_TZ.localize(datetime(target_date.year, target_date.month, target_date.day, 14, 0, 0))
-    else:
-        # 夜盤/全盤：刪當天 15:00 ~ 隔日 06:00（含 05:00）
+    elif session == "夜盤":
+        # 夜盤：刪當天 15:00 ~ 隔日 06:00（含 05:00）
         start_local = TAIPEI_TZ.localize(datetime(target_date.year, target_date.month, target_date.day, 15, 0, 0))
-        end_local = start_local + timedelta(days=1, hours=15)
+        end_local = start_local + timedelta(hours=15)
+    else:
+        # 全盤：刪當天 00:00 ~ 隔日 06:00（含 05:00），完整覆蓋「目標日全日 + 隔日 00:00~05:00」
+        start_local = TAIPEI_TZ.localize(datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0))
+        end_local = start_local + timedelta(days=1, hours=6)
 
     start_utc, end_utc = _utc_range_for_local_window(start_local, end_local)
 
@@ -164,10 +209,27 @@ def has_sufficient_data(target_date: date_type, session: str) -> bool:
         "SELECT COUNT(*) FROM ticks WHERE code=? AND ts >= ? AND ts <= ?",
         ("TXFR1", start_utc, end_utc),
     )
-    count = int(cursor.fetchone()[0] or 0)
+    evening_count = int(cursor.fetchone()[0] or 0)
+
+    if session == "夜盤":
+        conn.close()
+        # 夜盤 evening 約 540 根
+        return evening_count >= 400
+
+    # 全盤：同時要求日盤與夜盤 evening 都足夠，避免只補到半邊就誤判為完整。
+    end_time = get_day_session_end_time(target_date)
+    end_h, end_m = map(int, end_time.split(":"))
+    day_start_local = TAIPEI_TZ.localize(datetime(target_date.year, target_date.month, target_date.day, 8, 45, 0))
+    day_end_local = TAIPEI_TZ.localize(datetime(target_date.year, target_date.month, target_date.day, end_h, end_m, 0))
+    day_start_utc, day_end_utc = _utc_range_for_local_window(day_start_local, day_end_local)
+    cursor.execute(
+        "SELECT COUNT(*) FROM ticks WHERE code=? AND ts >= ? AND ts <= ?",
+        ("TXFR1", day_start_utc, day_end_utc),
+    )
+    day_count = int(cursor.fetchone()[0] or 0)
     conn.close()
-    # 夜盤 evening 約 540 根
-    return count >= 400
+
+    return (day_count >= 250) and (evening_count >= 400)
 
 
 def filter_kbars_for_session(df: pd.DataFrame, target_date: date_type, session: str) -> pd.DataFrame:
@@ -227,6 +289,8 @@ def main():
 
     today = datetime.now(TAIPEI_TZ).date()
     dates_to_fetch = iter_recent_weekdays(today, args.days)
+    if args.order == "newest":
+        dates_to_fetch = list(reversed(dates_to_fetch))
 
     print("============================================================")
     print(f"預計回填：{len(dates_to_fetch)} 天 | 時段：{args.session} | skip_existing={args.skip_existing} | force={args.force}")
@@ -234,11 +298,13 @@ def main():
 
     api = sj.Shioaji()
     print("登入 Shioaji...")
-    api_key = args.api_key or os.getenv("SHIOAJI_API_KEY")
-    secret_key = args.secret_key or os.getenv("SHIOAJI_SECRET_KEY")
+    api_key, secret_key = get_shioaji_credentials(args.api_key, args.secret_key)
     if not api_key or not secret_key:
         raise RuntimeError(
-            "缺少 Shioaji 憑證。請使用參數 --api-key/--secret-key，或設定環境變數 SHIOAJI_API_KEY/SHIOAJI_SECRET_KEY。"
+            "缺少 Shioaji 憑證。請用以下任一方式提供：\n"
+            "1) 參數 --api-key/--secret-key\n"
+            "2) 環境變數 SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY\n"
+            "3) Streamlit secrets：<root>/.streamlit/secrets.toml 內設定 SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY"
         )
     api.login(
         api_key=api_key,
@@ -294,28 +360,38 @@ def main():
                     print(f"[{i}/{len(dates_to_fetch)}] {d} 過濾後無數據（可能休市），跳過")
                 continue
 
-            batch_ticks = []
-            for idx, row in df.iterrows():
-                if idx.tzinfo is None:
-                    idx = TAIPEI_TZ.localize(idx)
-                else:
-                    idx = idx.tz_convert(TAIPEI_TZ)
+            # 時區標準化：一次性處理 index，避免逐列 localize 的效能問題
+            idx = df.index
+            if idx.tz is None:
+                df = df.copy()
+                df.index = idx.tz_localize(TAIPEI_TZ)
+            else:
+                df = df.copy()
+                df.index = idx.tz_convert(TAIPEI_TZ)
 
-                batch_ticks.append(
-                    {
-                        "ts": idx,
-                        "code": contract.code,
-                        "open": row.get("Open", row.get("Close", 0)),
-                        "high": row.get("High", row.get("Close", 0)),
-                        "low": row.get("Low", row.get("Close", 0)),
-                        "close": row.get("Close", 0),
-                        "volume": row.get("Volume", 0),
-                        "bid_price": row.get("Close", 0),
-                        "ask_price": row.get("Close", 0),
-                        "bid_volume": 0,
-                        "ask_volume": 0,
-                    }
-                )
+            close = df["Close"].to_numpy()
+            open_ = df["Open"].to_numpy()
+            high = df["High"].to_numpy()
+            low = df["Low"].to_numpy()
+            volume = df["Volume"].to_numpy()
+            ts_index = df.index
+
+            batch_ticks = [
+                {
+                    "ts": ts_index[i],
+                    "code": contract.code,
+                    "open": float(open_[i]) if pd.notna(open_[i]) else float(close[i]) if pd.notna(close[i]) else 0.0,
+                    "high": float(high[i]) if pd.notna(high[i]) else float(close[i]) if pd.notna(close[i]) else 0.0,
+                    "low": float(low[i]) if pd.notna(low[i]) else float(close[i]) if pd.notna(close[i]) else 0.0,
+                    "close": float(close[i]) if pd.notna(close[i]) else 0.0,
+                    "volume": int(volume[i]) if pd.notna(volume[i]) else 0,
+                    "bid_price": float(close[i]) if pd.notna(close[i]) else 0.0,
+                    "ask_price": float(close[i]) if pd.notna(close[i]) else 0.0,
+                    "bid_volume": 0,
+                    "ask_volume": 0,
+                }
+                for i in range(len(df))
+            ]
 
             save_ticks_batch(batch_ticks)
             success += 1

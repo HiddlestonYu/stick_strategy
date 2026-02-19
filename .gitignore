@@ -19,6 +19,9 @@ ENV/
 .streamlit/*
 !.streamlit/secrets.toml.example
 
+# Secrets
+.streamlit/secrets.toml
+
 # IDE
 .vscode/
 .idea/
@@ -36,6 +39,9 @@ test_*.py
 # Cache
 *.cache
 .cache/
+
+# Logs
+*.log
 
 # Jupyter Notebook
 .ipynb_checkpoints
