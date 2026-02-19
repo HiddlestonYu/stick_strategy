@@ -16,10 +16,16 @@ from plotly.subplots import make_subplots  # Plotly 子圖功能，用於建立�
 import pandas as pd  # Pandas 數據處理庫，用於資料分析和處理
 import shioaji as sj  # Shioaji API，用於獲取台灣期貨和股票即時數據
 from datetime import datetime, timedelta  # 日期時間處理
+import math
 import pytz  # 時區處理庫，用於處理不同時區的時間
 import time  # 時間處理，用於自動刷新
 import pickle  # 序列化工具，用於資料快取
 import os  # 檔案系統操作
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:  # pragma: no cover
+    st_autorefresh = None
 from stock_city.db.tick_database import (
     get_kbars_from_db,
     save_tick,
@@ -439,13 +445,27 @@ with st.sidebar:
             value=True,  # 預設啟用
             help="啟用後，圖表會自動更新以顯示最新即時數據"
         )
+
+        lightweight_update = st.checkbox(
+            "輕量更新（只更新最新K棒）",
+            value=True,
+            help="開盤自動刷新時只更新最新一根 K 棒（用 snapshots 最新價），減少整張圖重繪造成的閃爍。",
+        )
+        st.session_state["lightweight_update"] = bool(lightweight_update)
+
+        if st.button("🧹 重置輕量更新快取", use_container_width=True):
+            st.session_state.pop("light_cache_key", None)
+            st.session_state.pop("light_cache_df", None)
+            st.session_state.pop("light_cache_data_source", None)
+            st.session_state.pop("light_cache_is_realtime", None)
+            st.success("✅ 已重置快取")
         
         if auto_refresh:
             refresh_interval = st.slider(
                 "刷新間隔（秒）",
                 min_value=1,
                 max_value=60,
-                value=1,  # 預設1秒更新
+                value=3,  # 預設3秒更新（降低閃爍/負載）
                 step=1,
                 help="設定圖表自動更新的時間間隔"
             )
@@ -1664,6 +1684,78 @@ def process_kline_data(df, interval, session):
     
     return df
 
+
+def apply_realtime_snapshot_to_kbars(df: pd.DataFrame, interval: str, latest_price: float) -> pd.DataFrame:
+    """用最新價格即時更新最後一根 K 棒。
+
+    說明：
+    - 這是「顯示用」的即時更新：用 snapshots 的最新成交價，更新當前這根 K 棒的 Close/High/Low。
+    - 若已跨到下一個週期，會自動新增一根新 K 棒（成交量暫用 0）。
+    - 日K不做即時更新（避免 00:00 的日期問題、且日K即時意義較低）。
+    """
+    if df is None or df.empty:
+        return df
+    if interval == "1d":
+        return df
+    if latest_price is None:
+        return df
+    try:
+        latest_price = float(latest_price)
+    except Exception:
+        return df
+    if not (latest_price > 0):
+        return df
+
+    minutes_map = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
+    interval_minutes = minutes_map.get(interval)
+    if interval_minutes is None:
+        return df
+
+    taipei_tz = pytz.timezone("Asia/Taipei")
+    now = datetime.now(taipei_tz).replace(second=0, microsecond=0)
+
+    # 將 now 轉成與 df.index 一致的時區
+    if getattr(df.index, "tz", None) is not None:
+        try:
+            now = now.astimezone(df.index.tz)
+        except Exception:
+            pass
+
+    # 將目前時間 floor 到對應週期（例如 12:03 -> 12:00 for 5m）
+    minute = (now.minute // interval_minutes) * interval_minutes
+    bar_ts = now.replace(minute=minute)
+
+    df = df.copy()
+    last_ts = df.index[-1]
+
+    # 若已跨到下一根，補一根新 K 棒（Open = 前一根 Close）
+    if bar_ts > last_ts:
+        prev_close = float(df.loc[last_ts, "Close"]) if "Close" in df.columns else latest_price
+        new_row = {
+            "Open": prev_close,
+            "High": latest_price,
+            "Low": latest_price,
+            "Close": latest_price,
+            "Volume": 0,
+        }
+        df.loc[bar_ts] = new_row
+        df = df.sort_index()
+    else:
+        # 更新最後一根（視為當前進行中 K 棒）
+        last_ts = df.index[-1]
+        if "High" in df.columns:
+            df.loc[last_ts, "High"] = max(float(df.loc[last_ts, "High"]), latest_price)
+        if "Low" in df.columns:
+            df.loc[last_ts, "Low"] = min(float(df.loc[last_ts, "Low"]), latest_price)
+        df.loc[last_ts, "Close"] = latest_price
+
+    # 重新計算均線（只要最後一根正確即可，成本也不高）
+    if "Close" in df.columns:
+        df.loc[:, "MA10"] = df["Close"].rolling(window=10).mean()
+        df.loc[:, "MA20"] = df["Close"].rolling(window=20).mean()
+
+    return df
+
 # 主要數據獲取函數
 def get_data(interval, product, session, max_kbars, use_shioaji=False, api_instance=None):
     """
@@ -1734,10 +1826,51 @@ try:
 except:
     use_shioaji_flag = False
 
+# 輕量更新：僅更新最新 K 棒（減少閃爍）
+market_status_text, market_is_open, market_session = get_market_status()
+should_realtime_update = session_option == "全盤" or session_option == market_session
+cache_key = f"{product_option}::{session_option}::{interval_option}::{max_kbars}"
+
 # 取得資料時傳遞 API 實例
 if use_shioaji_flag:
     api_instance = st.session_state['shioaji_api']
-    df, data_source, is_realtime = get_data(interval_option, product_option, session_option, max_kbars, use_shioaji_flag, api_instance)
+    # 只有在開盤、自動刷新、且非日K 時，才適用輕量更新
+    use_light_update = bool(
+        auto_refresh
+        and refresh_interval
+        and st.session_state.get("lightweight_update", True)
+        and market_is_open
+        and should_realtime_update
+        and interval_option != "1d"
+    )
+
+    cached_df = st.session_state.get("light_cache_df")
+    cached_key = st.session_state.get("light_cache_key")
+    if use_light_update and cached_df is not None and cached_key == cache_key:
+        # 用最新成交價更新最後一根K棒（顯示用）
+        try:
+            contract = api_instance.Contracts.Futures.TXF.TXFR1
+            snapshot = api_instance.snapshots([contract])
+            latest_price = getattr(snapshot[0], "close", None) if snapshot and len(snapshot) > 0 else None
+            df = apply_realtime_snapshot_to_kbars(cached_df, interval_option, float(latest_price) if latest_price is not None else None)
+            if df is not None and len(df) > max_kbars:
+                df = df.tail(max_kbars)
+            data_source = st.session_state.get("light_cache_data_source", "SQLite DB（輕量更新）")
+            is_realtime = True
+            st.session_state["light_cache_df"] = df
+        except Exception:
+            df, data_source, is_realtime = get_data(interval_option, product_option, session_option, max_kbars, use_shioaji_flag, api_instance)
+            st.session_state["light_cache_df"] = df
+            st.session_state["light_cache_key"] = cache_key
+            st.session_state["light_cache_data_source"] = data_source
+            st.session_state["light_cache_is_realtime"] = is_realtime
+    else:
+        df, data_source, is_realtime = get_data(interval_option, product_option, session_option, max_kbars, use_shioaji_flag, api_instance)
+        # 存快取，供下一輪輕量更新使用
+        st.session_state["light_cache_df"] = df
+        st.session_state["light_cache_key"] = cache_key
+        st.session_state["light_cache_data_source"] = data_source
+        st.session_state["light_cache_is_realtime"] = is_realtime
 else:
     df, data_source, is_realtime = get_data(interval_option, product_option, session_option, max_kbars, use_shioaji_flag)
 
@@ -1803,6 +1936,26 @@ if df is not None:
         st.sidebar.info(f"📊 圖表顯示全部 {len(df)} 筆數據 (滑桿設定: {max_kbars})")
     
     # 顯示當前顯示的數據範圍
+    # ------------------------------------------------------------
+    # 即時顯示：開盤中用最新成交價更新最後一根 K 棒
+    # ------------------------------------------------------------
+    try:
+        market_status_text, market_is_open, market_session = get_market_status()
+        should_realtime_update = session_option == "全盤" or session_option == market_session
+        if use_shioaji_flag and market_is_open and should_realtime_update and interval_option != "1d":
+            contract = api_instance.Contracts.Futures.TXF.TXFR1
+            snapshot = api_instance.snapshots([contract])
+            if snapshot and len(snapshot) > 0:
+                latest_price = getattr(snapshot[0], "close", None)
+                if latest_price is not None and float(latest_price) > 0:
+                    df = apply_realtime_snapshot_to_kbars(df, interval_option, float(latest_price))
+                    if len(df) > max_kbars:
+                        df = df.tail(max_kbars)
+                    st.sidebar.caption(f"⚡ 即時價格（顯示用）: {float(latest_price):.0f}")
+    except Exception:
+        # 即時更新失敗不影響主要顯示
+        pass
+
     if len(df) > 0:
         first_date = df.index[0].strftime('%Y-%m-%d') if hasattr(df.index[0], 'strftime') else str(df.index[0])
         last_date = df.index[-1].strftime('%Y-%m-%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
@@ -1816,7 +1969,12 @@ if df is not None:
     # 5.0 建立連續的 x 軸索引（移除所有空白間隙）
     # ------------------------------------------------------------
     # 將時間索引轉換為字串格式，用於顯示
-    date_labels = df.index.strftime('%Y-%m-%d %H:%M') if len(df) > 0 and hasattr(df.index[0], 'strftime') else df.index.astype(str)
+    if len(df) > 0 and hasattr(df.index[0], 'strftime'):
+        # 日K 的 index 常落在 00:00，顯示時移除時間以避免誤導
+        date_fmt = '%Y-%m-%d' if interval_option == '1d' else '%Y-%m-%d %H:%M'
+        date_labels = df.index.strftime(date_fmt)
+    else:
+        date_labels = df.index.astype(str)
     # 建立連續的數字索引（0, 1, 2, 3...）確保沒有任何空白
     x_range = list(range(len(df)))
     
@@ -1927,7 +2085,9 @@ if df is not None:
         paper_bgcolor='rgb(20, 20, 20)', # 整個畫布背景色
         font=dict(color='white'),         # 字體顏色（白色）
         title_text=f"{product_option} - {session_option} - {interval_option} K線圖 [資料來源: {data_source}] (顯示 {len(df)} 筆)",
-        hovermode='x unified'             # 滑鼠懸停時顯示十字線和統一提示
+        hovermode='x unified',            # 滑鼠懸停時顯示十字線和統一提示
+        uirevision='stock-city-chart',    # 保留互動狀態，降低重繪閃爍
+        transition=dict(duration=0),      # 關閉轉場動畫，避免閃亮感
     )
     
     # ------------------------------------------------------------
@@ -1946,16 +2106,61 @@ if df is not None:
     )
     
     # 更新 y 軸設定，使用自動縮放並加上邊距
-    fig.update_yaxes(
-        automargin=True,
-        row=1, col=1
-    )
+    # ------------------------------------------------------------
+    # 5.5.2 固定/黏性 Y 軸範圍（夜盤觀察時避免一直跳動）
+    # ------------------------------------------------------------
+    # 你的習慣：1 單位 = 0.05K = 50 點，要求上下預留 2 單位 = 100 點
+    y_step_points = 50
+    y_padding_points = 2 * y_step_points
+
+    try:
+        if interval_option != "1d" and ("High" in df.columns) and ("Low" in df.columns) and len(df) > 0:
+            cur_low = float(df["Low"].min())
+            cur_high = float(df["High"].max())
+
+            if math.isfinite(cur_low) and math.isfinite(cur_high) and cur_low < cur_high:
+                desired_low = math.floor((cur_low - y_padding_points) / y_step_points) * y_step_points
+                desired_high = math.ceil((cur_high + y_padding_points) / y_step_points) * y_step_points
+
+                # 只擴不縮：避免每次 tick 小波動就改 y 軸
+                y_key = f"sticky_y_range::{product_option}::{session_option}::{interval_option}"
+                prev_range = st.session_state.get(y_key)
+                if isinstance(prev_range, (tuple, list)) and len(prev_range) == 2:
+                    prev_low, prev_high = prev_range
+                    y_low = min(float(prev_low), float(desired_low))
+                    y_high = max(float(prev_high), float(desired_high))
+                else:
+                    y_low, y_high = float(desired_low), float(desired_high)
+
+                # 避免範圍過小造成畫面壓縮
+                if (y_high - y_low) < (4 * y_step_points):
+                    mid = (y_high + y_low) / 2.0
+                    half = 2 * y_step_points
+                    y_low = mid - half
+                    y_high = mid + half
+
+                st.session_state[y_key] = (y_low, y_high)
+
+                fig.update_yaxes(
+                    range=[y_low, y_high],
+                    autorange=False,
+                    automargin=True,
+                    row=1,
+                    col=1,
+                )
+            else:
+                fig.update_yaxes(automargin=True, row=1, col=1)
+        else:
+            fig.update_yaxes(automargin=True, row=1, col=1)
+    except Exception:
+        fig.update_yaxes(automargin=True, row=1, col=1)
     
     # ------------------------------------------------------------
     # 5.6 顯示圖表
     # ------------------------------------------------------------
-    # width='stretch' 讓圖表自動伸展填滿容器寬度
-    st.plotly_chart(fig, width='stretch')
+    # 使用 placeholder 固定版面，降低每次更新的閃動感
+    chart_placeholder = st.empty()
+    chart_placeholder.plotly_chart(fig, use_container_width=True)
 
     # ------------------------------------------------------------
     # 5.7 最新報價資訊顯示
@@ -1999,16 +2204,14 @@ if df is not None:
     
     # 自動刷新邏輯（只在即時模式啟用）
     if auto_refresh and refresh_interval and is_realtime:
-        # 顯示倒數計時
-        countdown_placeholder = st.empty()
-        
-        for remaining in range(refresh_interval, 0, -1):
-            countdown_placeholder.info(f"⏱️ 下次更新倒數: {remaining} 秒")
-            time.sleep(1)
-        
-        countdown_placeholder.success("🔄 正在更新...")
-        time.sleep(0.5)
-        st.rerun()
+        # 改成平滑刷新：避免每秒倒數造成的頻繁重繪與閃屏
+        if st_autorefresh is not None:
+            st_autorefresh(interval=int(refresh_interval * 1000), key="smooth_autorefresh")
+            st.caption(f"⏱️ 自動刷新：每 {refresh_interval} 秒更新一次")
+        else:
+            st.caption(f"⏱️ 自動刷新：每 {refresh_interval} 秒更新一次")
+            time.sleep(refresh_interval)
+            st.rerun()
     elif auto_refresh and not is_realtime:
         st.info("ℹ️ 當前為歷史數據，自動刷新已暫停")
 
