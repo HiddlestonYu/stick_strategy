@@ -219,6 +219,7 @@ with st.sidebar:
     # ------------------------------------------------------------
     with st.expander("⚙️ Shioaji 帳號設定（選填）", expanded=True):
         use_shioaji = st.checkbox("使用 Shioaji 即時數據", value=True)
+        st.session_state["use_shioaji_checkbox"] = use_shioaji  # 儲存到 session state
         
         # 重要提示
         if use_shioaji:
@@ -330,22 +331,78 @@ with st.sidebar:
                                 )
                                 if new_api:
                                     st.success("✅ Shioaji 憑證登入成功！")
-                                    st.info("� 已啟用多合約拼接功能，可獲取完整歷史數據")
+                                    st.info("✓ 已啟用多合約拼接功能，可獲取完整歷史數據")
                                     st.session_state['shioaji_logged_in'] = True
                                     st.session_state['shioaji_api'] = new_api
                                     st.rerun()
                                 else:
-                                    st.error(f"❌ 登入失敗: {error if error else '未知錯誤'}")
-                                    if error and ('連線數過多' in str(error) or 'Too Many Connections' in str(error)):
-                                        st.warning("⚠️ 連線數過多的解決方式：")
-                                        st.info("1️⃣ 點擊「🔄 強制重置」按鈕清除連線\n2️⃣ 等待 1-2 分鐘讓舊連線逾時\n3️⃣ 確認沒有其他程式或瀏覽器分頁在使用 Shioaji\n4️⃣ 聯繫永豐證券客服重置連線")
-                                    else:
-                                        st.warning("💡 提示: 如果出現連線數過多，請稍等1-2分鐘或聯繫永豐證券客服")
+                                    error_str = str(error) if error else '未知錯誤'
                                     st.session_state['shioaji_logged_in'] = False
+                                    
+                                    # 自動取消勾選，改用 DB 模式
+                                    st.session_state["use_shioaji_checkbox"] = False
+                                    
+                                    st.error(f"❌ 登入失敗，已自動切換至本地數據庫")
+                                    st.caption(f"📋 錯誤信息: {error_str}")
+                                    
+                                    # 針對不同錯誤提供解決方案
+                                    if 'Sign data is timeout' in error_str:
+                                        st.warning("🕐 **證書簽名超時 (Sign data is timeout)**")
+                                        st.info(
+                                            "✅ 系統已自動改用本地 SQLite 資料庫，可繼續使用所有分析功能\n\n"
+                                            "**如需啟用 Shioaji 即時數據，請解決以下問題：**\n"
+                                            "1️⃣ **檢查系統時間** - 確保與網路時間同步（可能差超過30秒）\n"
+                                            "2️⃣ **重新下載憑證** - 到永豐證券官網重新下載最新 .pfx 文件\n"
+                                            "3️⃣ **使用 API Key 登入** - 改用 API Key 和 Secret Key 方式登入\n"
+                                            "4️⃣ **稍後再試** - 等 2-3 分鐘後，可能伺服器暫時繁忙\n"
+                                            "5️⃣ **聯繫客服** - 若問題持續，請聯繫永豐證券客服"
+                                        )
+                                    elif '連線數過多' in error_str or 'Too Many Connections' in error_str:
+                                        st.warning("🔗 **連線數過多**")
+                                        st.info(
+                                            "✅ 系統已自動改用本地 SQLite 資料庫\n\n"
+                                            "**如需解除連線限制：**\n"
+                                            "1️⃣ 點擊「🔄 強制重置」按鈕清除舊連線\n"
+                                            "2️⃣ 等待 1-2 分鐘讓舊連線逾時\n"
+                                            "3️⃣ 確認沒有其他程式或瀏覽器分頁在使用 Shioaji\n"
+                                            "4️⃣ 聯繫永豐證券客服重置帳號連線數"
+                                        )
+                                    else:
+                                        st.warning("🔍 **登入驗證失敗**")
+                                        st.info(
+                                            "✅ 系統已自動改用本地 SQLite 資料庫\n\n"
+                                            "**檢查事項：**\n"
+                                            "• 身分證字號是否輸入正確\n"
+                                            "• 憑證密碼是否正確\n"
+                                            "• 憑證文件 (Sinopac.pfx) 是否存在且未損壞"
+                                        )
+                                    
+                                    st.success(
+                                        "💡 **已切換至本地數據庫**\n"
+                                        "✓ 可查看 300 天的歷史 K 線數據\n"
+                                        "✓ 所有 MA 均線和策略分析功能可用\n"
+                                        "✓ 刷新頁面後立即生效\n\n"
+                                        "**如後續想使用 Shioaji 即時數據，解決上述問題後重新勾選「使用 Shioaji」即可**"
+                                    )
                             except Exception as e:
-                                st.error(f"❌ 登入失敗: {str(e)}")
-                                st.warning("💡 提示: 請檢查身分證字號和憑證密碼是否正確")
                                 st.session_state['shioaji_logged_in'] = False
+                                st.session_state["use_shioaji_checkbox"] = False  # 自動取消勾選
+                                
+                                st.error(f"❌ 登入異常，已自動切換至本地數據庫")
+                                st.caption(f"📋 錯誤信息: {str(e)}")
+                                st.warning("🔍 **檢查您的登入憑證**")
+                                st.info(
+                                    "✅ 系統已自動改用本地 SQLite 資料庫\n\n"
+                                    "**檢查事項：**\n"
+                                    "• API Key 是否正確複製\n"
+                                    "• Secret Key 是否正確複製\n"
+                                    "• 是否有多餘的空格或特殊字符\n\n"
+                                    "💡 如需使用 Shioaji 即時數據，請確認憑證後重新嘗試"
+                                )
+                                st.success(
+                                    "✅ **已切換至本地數據庫**\n"
+                                    "刷新頁面後即可使用 300 天歷史數據和所有分析功能"
+                                )
                 else:
                     if not api_key or not secret_key:
                         st.warning("請輸入 API Key 和 Secret Key")
@@ -397,11 +454,11 @@ with st.sidebar:
     # 3.4 K線週期選擇（提前，因為會影響時段選擇）
     # ------------------------------------------------------------
     # 支援從 1 分鐘到日線的多種時間週期
-    # index=5 表示預設選擇日K（1d）
+    # index=1 表示預設選擇 5m
     interval_option = st.selectbox(
         "選擇 K 線週期",
         ("1m", "5m", "15m", "30m", "60m", "1d"),
-        index=5  # 預設日K
+        index=1  # 預設 5m
     )
     
     # ------------------------------------------------------------
@@ -422,12 +479,12 @@ with st.sidebar:
     # 3.5 最大K棒數量滑桿
     # ------------------------------------------------------------
     # 限制圖表顯示的 K 棒數量，避免資料過多導致效能問題
-    # 範圍：20-1000 根，預設 100 根，每次調整 10 根
+    # 範圍：20-1000 根，預設 300 根，每次調整 10 根
     max_kbars = st.slider(
         "顯示K棒數量",
         min_value=20,
         max_value=1000,
-        value=100,
+        value=300,
         step=10,
         help="設定圖表顯示的最大K棒數量（使用快取可顯示更多歷史數據）"
     )
@@ -474,6 +531,37 @@ with st.sidebar:
             refresh_interval = None
             st.info("ℹ️ 手動模式：點擊重新載入按鈕以更新數據")
     
+    # 顯示提示訊息
+    st.caption("💡 提示：啟用自動刷新可獲得動態K棒更新效果。")
+    
+    st.divider()  # 分隔線
+    
+    # ============================================================
+    # 3.7 策略設定
+    # ============================================================
+    with st.expander("🎯 MA交叉吞噬策略", expanded=False):
+        enable_strategy = st.checkbox(
+            "啟用策略信號",
+            value=False,
+            help="啟用後將在圖表上標示進場/退場信號，並顯示交易紀錄"
+        )
+        st.session_state["enable_strategy"] = enable_strategy
+        
+        if enable_strategy:
+            strategy_type = st.selectbox(
+                "選擇策略類型",
+                ("MA交叉吞噬策略",),  # 未來可擴展更多策略
+                help="MA交叉吞噬策略：檢測MA10/MA20都向上趨勢時，在碰MA且下一根吞噬時進場"
+            )
+            st.session_state["strategy_type"] = strategy_type
+            st.info(
+                "📌 **策略規則**\n\n"
+                "• **進場**：MA10+MA20都向上 → K棒碰MA → 下一根吞噬（Close > 前Close） → 進場做多\n"
+                "• **加碼**：最新K棒吞噬前一根\n"
+                "• **做空**：反向邏輯（趨勢向下 → 碰MA → 反向吞噬）\n"
+                "• **退場**：相反信號出現時清倉"
+            )
+
     # 顯示提示訊息
     st.caption("💡 提示：啟用自動刷新可獲得動態K棒更新效果。")
 
@@ -950,6 +1038,13 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
         
         # 從 database 讀取並組成 K 棒
         df = get_kbars_from_db(interval=interval, session=session, days=days)
+
+        # 若近期資料不足，改用更長回溯天數避免空資料
+        if df is None or df.empty:
+            fallback_days = 1200 if interval == "1d" else 300
+            if days < fallback_days:
+                st.sidebar.warning("⚠️ 近期資料不足，改用較長回溯天數查詢...")
+                df = get_kbars_from_db(interval=interval, session=session, days=fallback_days)
 
         # ------------------------------------------------------------
         # 自動回填：日K 時若 DB 歷史不足，且已登入 Shioaji，則自動往更早的交易日補齊
@@ -1756,6 +1851,255 @@ def apply_realtime_snapshot_to_kbars(df: pd.DataFrame, interval: str, latest_pri
 
     return df
 
+# ==================== MA交叉吞噬策略計算 ====================
+def calculate_ma_crossover_engulfing_signals(df, min_bars=25):
+    """
+    計算 MA 交叉吞噬策略信號
+    
+    規則：
+    1. 檢測 MA10 和 MA20 都向上趨勢（MA 斜率 > 0）
+    2. 進場信號：K 棒碰到 MA10 或 MA20，且下一根 K 棒吞噬（Close[i] > Close[i-1]）
+    3. 加碼信號：最新 K 棒吞噬前一根（Close[i] > Close[i-1]）
+    4. 退場信號：相反邏輯（K 棒碰到 MA，下一根下跌）
+    
+    輸入：
+        df: DataFrame with 'Open', 'High', 'Low', 'Close', 'Volume', 'MA10', 'MA20'
+        min_bars: 最少需要的K棒數（預設25，確保MA計算有效）
+    
+    輸出：
+        trades: List of trade dicts with keys: 
+            'entry_idx', 'entry_price', 'exit_idx', 'exit_price', 'direction', 'bars_held'
+    """
+    if df is None or len(df) < min_bars:
+        return []
+    
+    df = df.copy()
+    trades = []
+    
+    # 確保有 MA10/MA20
+    if "MA10" not in df.columns or "MA20" not in df.columns:
+        df["MA10"] = df["Close"].rolling(window=10).mean()
+        df["MA20"] = df["Close"].rolling(window=20).mean()
+    
+    # 計算 MA 斜率（用簡單差分表示趨勢）
+    df["MA10_slope"] = df["MA10"].diff()
+    df["MA20_slope"] = df["MA20"].diff()
+    
+    # 偵測是否 K 棒「碰到」MA（touch）
+    # 定義：Low <= MA <= High（觸及範圍內）
+    df["touch_ma10"] = (df["Low"] <= df["MA10"]) & (df["MA10"] <= df["High"])
+    df["touch_ma20"] = (df["Low"] <= df["MA20"]) & (df["MA20"] <= df["High"])
+    
+    # 偵測吞噬信號：Close[i] > Close[i-1]
+    df["is_engulfing"] = df["Close"] > df["Close"].shift(1)
+    
+    # 追蹤當前部位（None, 'LONG', 'SHORT'）
+    position = None
+    entry_idx = None
+    entry_price = None
+    bars_in_position = 0
+    
+    for i in range(2, len(df)):  # 從第3根開始（前2根用於計算斜率和吞噬）
+        row_prev = df.iloc[i-1]
+        row_curr = df.iloc[i]
+        
+        # 檢查趨勢（MA10 和 MA20 都向上）
+        uptrend = (row_curr["MA10_slope"] > 0) and (row_curr["MA20_slope"] > 0)
+        downtrend = (row_curr["MA10_slope"] < 0) and (row_curr["MA20_slope"] < 0)
+        
+        # 進場邏輯：前一根碰到 MA + 當前根吞噬
+        touch_ma = row_prev["touch_ma10"] or row_prev["touch_ma20"]
+        engulfing = row_curr["is_engulfing"]
+        
+        # 做多進場：趨勢向上 + 碰 MA + 吞噬
+        if position is None and uptrend and touch_ma and engulfing:
+            position = "LONG"
+            entry_idx = i
+            entry_price = row_curr["Close"]
+            bars_in_position = 1
+        
+        # 做空進場：趨勢向下 + 碰 MA + 反向吞噬
+        elif position is None and downtrend and touch_ma and (not engulfing):
+            position = "SHORT"
+            entry_idx = i
+            entry_price = row_curr["Close"]
+            bars_in_position = 1
+        
+        # 加碼邏輯：當前根吞噬前一根（維持部位方向）
+        elif position == "LONG" and engulfing:
+            bars_in_position += 1
+        
+        elif position == "SHORT" and (not engulfing):
+            bars_in_position += 1
+        
+        # 退場邏輯：反向吞噬或趨勢改變
+        elif position is not None:
+            exit_signal = False
+            
+            if position == "LONG":
+                # 做多退場：K棒碰MA + 下一根下跌（反向吞噬）
+                if touch_ma and (not engulfing):
+                    exit_signal = True
+            
+            else:  # SHORT
+                # 做空退場：K棒碰MA + 下一根上漲（反向吞噬）
+                if touch_ma and engulfing:
+                    exit_signal = True
+            
+            if exit_signal:
+                trades.append({
+                    "entry_idx": entry_idx,
+                    "entry_ts": df.index[entry_idx],
+                    "entry_price": entry_price,
+                    "exit_idx": i,
+                    "exit_ts": df.index[i],
+                    "exit_price": row_curr["Close"],
+                    "direction": position,
+                    "bars_held": bars_in_position,
+                    "pnl": (row_curr["Close"] - entry_price) if position == "LONG" else (entry_price - row_curr["Close"]),
+                })
+                position = None
+                entry_idx = None
+                entry_price = None
+                bars_in_position = 0
+    
+    return trades
+
+# ==================== MA趨勢觸及吞噬策略計算 ====================
+def calculate_ma_trend_engulfing_signals(df, min_bars=25):
+    """
+    計算 MA 趨勢觸及吞噬策略信號
+
+     規則：
+     1. 趨勢判斷：MA10 與 MA20 同方向（斜率皆 > 0 或皆 < 0）
+     2. 進場：前一根 K 棒觸及 MA10 或 MA20，且當前 K 棒吞噬前一根
+         - 做多：趨勢向上 + 收盤 > 前一根收盤
+         - 做空：趨勢向下 + 收盤 < 前一根收盤
+    3. 退場：出現反向吞噬即退場（補單=退場）
+
+    輸出：
+        trades: 交易紀錄
+        add_events: 補單信號列表
+    """
+    if df is None or len(df) < min_bars:
+        return [], []
+
+    df = df.copy()
+    trades = []
+    add_events = []
+
+    # 確保有 MA10/MA20
+    if "MA10" not in df.columns or "MA20" not in df.columns:
+        df["MA10"] = df["Close"].rolling(window=10).mean()
+        df["MA20"] = df["Close"].rolling(window=20).mean()
+
+    # 計算 MA 斜率（用簡單差分表示趨勢）
+    df["MA10_slope"] = df["MA10"].diff()
+    df["MA20_slope"] = df["MA20"].diff()
+
+    # 偵測是否 K 棒「碰到」MA（touch）
+    df["touch_ma10"] = (df["Low"] <= df["MA10"]) & (df["MA10"] <= df["High"])
+    df["touch_ma20"] = (df["Low"] <= df["MA20"]) & (df["MA20"] <= df["High"])
+
+    position = None
+    entry_idx = None
+    entry_price = None
+    bars_in_position = 0
+    has_added = False
+
+    for i in range(1, len(df)):
+        row_prev = df.iloc[i - 1]
+        row_curr = df.iloc[i]
+
+        uptrend = (row_curr["MA10_slope"] > 0) and (row_curr["MA20_slope"] > 0)
+        downtrend = (row_curr["MA10_slope"] < 0) and (row_curr["MA20_slope"] < 0)
+
+        touch_ma = bool(row_prev["touch_ma10"] or row_prev["touch_ma20"])
+        engulf_up = row_curr["Close"] > row_prev["Close"]
+        engulf_down = row_curr["Close"] < row_prev["Close"]
+
+        if position is None:
+            # 做多進場
+            if uptrend and touch_ma and engulf_up:
+                position = "LONG"
+                entry_idx = i
+                entry_price = row_curr["Close"]
+                bars_in_position = 1
+                has_added = False
+            # 做空進場
+            elif downtrend and touch_ma and engulf_down:
+                position = "SHORT"
+                entry_idx = i
+                entry_price = row_curr["Close"]
+                bars_in_position = 1
+                has_added = False
+            continue
+
+        # 已持倉
+        bars_in_position += 1
+
+        # 退場：反向吞噬（補單=退場）
+        if position == "LONG" and engulf_down:
+            exit_idx = i
+            exit_price = row_curr["Close"]
+            trades.append({
+                "entry_idx": entry_idx,
+                "entry_ts": df.index[entry_idx],
+                "entry_price": entry_price,
+                "exit_idx": exit_idx,
+                "exit_ts": df.index[exit_idx],
+                "exit_price": exit_price,
+                "direction": position,
+                "bars_held": bars_in_position,
+                "pnl": exit_price - entry_price,
+                "exit_reason": "反向吞噬(補單=退場)",
+            })
+            position = None
+            entry_idx = None
+            entry_price = None
+            bars_in_position = 0
+            continue
+
+        if position == "SHORT" and engulf_up:
+            exit_idx = i
+            exit_price = row_curr["Close"]
+            trades.append({
+                "entry_idx": entry_idx,
+                "entry_ts": df.index[entry_idx],
+                "entry_price": entry_price,
+                "exit_idx": exit_idx,
+                "exit_ts": df.index[exit_idx],
+                "exit_price": exit_price,
+                "direction": position,
+                "bars_held": bars_in_position,
+                "pnl": entry_price - exit_price,
+                "exit_reason": "反向吞噬(補單=退場)",
+            })
+            position = None
+            entry_idx = None
+            entry_price = None
+            bars_in_position = 0
+            continue
+
+    # 若最後仍持倉，強制以最後一根收盤退場
+    if position is not None and entry_idx is not None:
+        exit_idx = len(df) - 1
+        exit_price = df.iloc[exit_idx]["Close"]
+        trades.append({
+            "entry_idx": entry_idx,
+            "entry_ts": df.index[entry_idx],
+            "entry_price": entry_price,
+            "exit_idx": exit_idx,
+            "exit_ts": df.index[exit_idx],
+            "exit_price": exit_price,
+            "direction": position,
+            "bars_held": bars_in_position,
+            "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+            "exit_reason": "最後一根收盤",
+        })
+
+    return trades, add_events
+
 # 主要數據獲取函數
 def get_data(interval, product, session, max_kbars, use_shioaji=False, api_instance=None):
     """
@@ -1801,9 +2145,16 @@ def get_data(interval, product, session, max_kbars, use_shioaji=False, api_insta
     # 最後的保險：確保有數據
     if df is None or df.empty:
         st.sidebar.error("❌ DB 目前沒有可用數據")
-        st.sidebar.caption("💡 可先執行回填腳本，例如：")
-        st.sidebar.caption("`python backfill_kbars.py --days 500 --session 日盤 --skip-existing`")
-        st.sidebar.caption("或登入 Shioaji 讓系統自動更新今日資料。")
+        st.sidebar.warning("💡 **解決方案**（擇一）：")
+        st.sidebar.info(
+            "**方案1：回填歷史數據**\n"
+            "執行回填腳本：\n"
+            "`python backfill_kbars.py --days 500 --skip-existing`\n\n"
+            "**方案2：登入 Shioaji**\n"
+            "1. 在左側「⚙️ Shioaji 帳號設定」登入\n"
+            "2. 系統會自動更新今日及後續數據\n"
+            "3. 首次可能需要 2-3 分鐘建立連線"
+        )
         return None, "無可用數據", False
     
     # 處理數據並計算技術指標
@@ -1818,13 +2169,28 @@ def get_data(interval, product, session, max_kbars, use_shioaji=False, api_insta
 # ============================================================
 # 4. 主程式執行：獲取數據並限制K棒數量
 # ============================================================
-# 4. 主程式執行：獲取數據並限制K棒數量
-# ============================================================
-# 呼叫 get_data 函數獲取 K 線數據（根據側邊欄設定決定使用哪個資料源）
+# 呼叫 get_data 函數獲取 K 線數據（本版一律使用本地 DB 顯示）
+# 核心邏輯：不論是否勾選或登入 Shioaji，都固定讀取 SQLite DB
 try:
     use_shioaji_flag = st.session_state.get('shioaji_logged_in', False) and 'shioaji_api' in st.session_state
 except:
     use_shioaji_flag = False
+
+# 強制本地 DB 模式（不論是否勾選或登入）
+force_db_only = True
+if force_db_only:
+    if use_shioaji_flag:
+        st.info("ℹ️ 已登入 Shioaji，但目前已鎖定使用本地 SQLite 資料庫顯示")
+    use_shioaji_flag = False
+    st.session_state["use_shioaji_checkbox"] = False
+
+# 如果未成功登入，確保 checkbox 被取消（防止狀態不同步）
+if not use_shioaji_flag:
+    st.session_state["use_shioaji_checkbox"] = False
+
+# 顯示本地 DB 模式提示
+if not use_shioaji_flag:
+    st.info("📊 **正在使用本地 SQLite 資料庫** | 包含歷史數據 | 所有分析功能可用")
 
 # 輕量更新：僅更新最新 K 棒（減少閃爍）
 market_status_text, market_is_open, market_session = get_market_status()
@@ -2053,6 +2419,63 @@ if df is not None:
         row=1, col=1
     )
 
+    # ============================================================
+    # 5.3.1 繪製策略信號標記
+    # ============================================================
+    if st.session_state.get("enable_strategy", False):
+        trades, add_events = calculate_ma_trend_engulfing_signals(df)
+        
+        if trades:
+            # 進場信號點
+            entry_indices = [t["entry_idx"] for t in trades]
+            entry_prices = [df.iloc[idx]["Close"] for idx in entry_indices]
+            entry_symbols = ["triangle-up" if t["direction"] == "LONG" else "triangle-down" for t in trades]
+            entry_colors = ["green" if t["direction"] == "LONG" else "red" for t in trades]
+            entry_labels = [f"進場 {t['direction']}" for t in trades]
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=entry_indices,
+                    y=entry_prices,
+                    mode='markers',
+                    marker=dict(
+                        size=12,
+                        symbol=entry_symbols,
+                        color=entry_colors,
+                        line=dict(color='white', width=2)
+                    ),
+                    name='進場信號',
+                    text=[f"進場: {p:.0f}<br>方向: {t['direction']}" for p, t in zip(entry_prices, trades)],
+                    hovertemplate='<b>%{text}</b><extra></extra>'
+                ),
+                row=1, col=1
+            )
+            
+            # 退場信號點
+            exit_indices = [t["exit_idx"] for t in trades]
+            exit_prices = [df.iloc[idx]["Close"] for idx in exit_indices]
+            exit_colors = ["darkgreen" if t["direction"] == "LONG" else "darkred" for t in trades]
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=exit_indices,
+                    y=exit_prices,
+                    mode='markers',
+                    marker=dict(
+                        size=10,
+                        symbol='circle',
+                        color=exit_colors,
+                        line=dict(color='yellow', width=2)
+                    ),
+                    name='退場信號',
+                    text=[f"退場: {p:.0f}<br>方向: {t['direction']}<br>損益: {t['pnl']:.0f}" for p, t in zip(exit_prices, trades)],
+                    hovertemplate='<b>%{text}</b><extra></extra>'
+                ),
+                row=1, col=1
+            )
+
+            # 補單已視為退場，不另外標記
+
     # ------------------------------------------------------------
     # 5.4 繪製成交量柱狀圖
     # ------------------------------------------------------------
@@ -2161,6 +2584,63 @@ if df is not None:
     # 使用 placeholder 固定版面，降低每次更新的閃動感
     chart_placeholder = st.empty()
     chart_placeholder.plotly_chart(fig, use_container_width=True)
+    
+    # ------------------------------------------------------------
+    # 5.6.0 策略選擇（K 線圖下方）
+    # ------------------------------------------------------------
+    st.checkbox(
+        "策略選擇：10/20MA 趨勢 + 觸及 + 吞噬（進場/補單）",
+        value=st.session_state.get("enable_strategy", False),
+        key="enable_strategy",
+        help="趨勢同向時，K棒觸及 MA 且下一根吞噬即進場；持倉期間同向吞噬補單，反向吞噬退場"
+    )
+    # ============================================================
+    # 5.6.1 顯示策略交易紀錄
+    # ============================================================
+    if st.session_state.get("enable_strategy", False):
+        trades, _ = calculate_ma_trend_engulfing_signals(df)
+        
+        if trades:
+            with st.expander("📋 交易紀錄", expanded=True):
+                # 構建交易紀錄 DataFrame
+                trade_records = []
+                for i, trade in enumerate(trades, 1):
+                    entry_ts = trade["entry_ts"]
+                    exit_ts = trade["exit_ts"]
+                    
+                    # 格式化時間戳
+                    entry_time = entry_ts.strftime('%m-%d %H:%M') if hasattr(entry_ts, 'strftime') else str(entry_ts)
+                    exit_time = exit_ts.strftime('%m-%d %H:%M') if hasattr(exit_ts, 'strftime') else str(exit_ts)
+                    
+                    trade_records.append({
+                        "編號": i,
+                        "進場時間": entry_time,
+                        "進場價": f"{trade['entry_price']:.0f}",
+                        "退場時間": exit_time,
+                        "退場價": f"{trade['exit_price']:.0f}",
+                        "方向": trade["direction"],
+                        "持倉K棒數": trade["bars_held"],
+                        "退場原因": trade.get("exit_reason", ""),
+                        "損益": f"{trade['pnl']:+.0f}"
+                    })
+                
+                trades_df = pd.DataFrame(trade_records)
+                st.dataframe(trades_df, use_container_width=True, hide_index=True)
+                
+                # 統計信息
+                total_trades = len(trades)
+                long_trades = sum(1 for t in trades if t["direction"] == "LONG")
+                short_trades = sum(1 for t in trades if t["direction"] == "SHORT")
+                total_pnl = sum(t["pnl"] for t in trades)
+                
+                col_stats1, col_stats2, col_stats3, col_stats4 = st.columns(4)
+                col_stats1.metric("總交易數", total_trades)
+                col_stats2.metric("做多", long_trades)
+                col_stats3.metric("做空", short_trades)
+                col_stats4.metric("總損益", f"{total_pnl:+.0f}")
+        else:
+            st.info("ℹ️ 未找到符合策略的交易信號，請調整條件或檢查K棒數據")
+
 
     # ------------------------------------------------------------
     # 5.7 最新報價資訊顯示
@@ -2215,13 +2695,36 @@ if df is not None:
     elif auto_refresh and not is_realtime:
         st.info("ℹ️ 當前為歷史數據，自動刷新已暫停")
 
+
 else:
-    # ------------------------------------------------------------
     # 當數據獲取失敗時顯示錯誤訊息
-    # ------------------------------------------------------------
     st.error("❌ 目前無法獲取數據")
-    st.warning("💡 建議操作：")
-    st.info("1️⃣ 先回填 DB 歷史資料（例如 500 天）\n2️⃣ 檢查 Shioaji 登入狀態（用於自動更新今日資料）\n3️⃣ 確認網路連線正常")
+    
+    # 檢查是否是 Shioaji 未登入問題
+    shioaji_checked = st.session_state.get("use_shioaji_checkbox", False)
+    shioaji_logged = st.session_state.get("shioaji_logged_in", False)
+    
+    st.warning("🔧 **排查步驟**：")
+    
+    if shioaji_checked and not shioaji_logged:
+        st.error(
+            "**✗ 已勾選 Shioaji 但未登入**\n\n"
+            "您勾選了「使用 Shioaji 即時數據」但還沒登入。\n"
+            "請在左側「⚙️ Shioaji 帳號設定」中提供 API Key（或憑證）並點擊「登入 Shioaji」"
+        )
+    
+    st.info(
+        "**✓ 若無 Shioaji 帳號，請改成：**\n\n"
+        "1️⃣ **移除「使用 Shioaji 即時數據」的勾選**（如果已勾選的話）\n\n"
+        "2️⃣ **回填 SQLite DB 歷史數據**：\n"
+        "   在終端機執行：\n"
+        "   ```\n"
+        "   cd stock_city/db\n"
+        "   python backfill_kbars.py --days 300 --skip-existing\n"
+        "   ```\n\n"
+        "3️⃣ **重新載入頁面** (按 F5 或按側邊欄「⟳ 重新執行」按鈕)"
+    )
+    
     st.caption("📝 本專案目前以 SQLite DB 為主要資料顯示來源")
 
 # ============================================================
