@@ -449,42 +449,53 @@ with st.sidebar:
     # 僅使用 Shioaji TXF 合約
     product_option = "台指期貨 (TXF)"
     st.markdown("**📊 商品：台指期貨 (TXF)**")
-    
+
+    # 根據是否登入 Shioaji 設定預設 K 線條件
+    logged_in = st.session_state.get("shioaji_logged_in", False) and "shioaji_api" in st.session_state
+
+    if logged_in:
+        # 已登入 Shioaji：日盤 + 5 分 K + 150 筆
+        default_interval_index = 1  # "5m"
+        default_session_index = 0   # "日盤"
+        default_kbars = 150
+    else:
+        # 未登入：日盤 + 日K + 100 筆
+        default_interval_index = 5  # "1d"
+        default_session_index = 0   # "日盤"
+        default_kbars = 100
+
     # ------------------------------------------------------------
     # 3.4 K線週期選擇（提前，因為會影響時段選擇）
     # ------------------------------------------------------------
     # 支援從 1 分鐘到日線的多種時間週期
-    # index=1 表示預設選擇 5m
     interval_option = st.selectbox(
         "選擇 K 線週期",
         ("1m", "5m", "15m", "30m", "60m", "1d"),
-        index=1  # 預設 5m
+        index=default_interval_index
     )
-    
+
     # ------------------------------------------------------------
     # 3.3 交易時段選擇
     # ------------------------------------------------------------
     # 全盤：顯示所有交易時段
     # 日盤：08:45 - 13:45
     # 夜盤：15:00 - 次日 05:00
-    # 預設日盤，並提供 全盤/日盤/夜盤 選項
-    default_session_index = 0  # 預設日盤
     session_option = st.selectbox(
         "選擇時段",
         ("日盤", "夜盤", "全盤"),
         index=default_session_index
     )
-    
+
     # ------------------------------------------------------------
     # 3.5 最大K棒數量滑桿
     # ------------------------------------------------------------
     # 限制圖表顯示的 K 棒數量，避免資料過多導致效能問題
-    # 範圍：20-1000 根，預設 300 根，每次調整 10 根
+    # 範圍：20-1000 根
     max_kbars = st.slider(
         "顯示K棒數量",
         min_value=20,
         max_value=1000,
-        value=300,
+        value=default_kbars,
         step=10,
         help="設定圖表顯示的最大K棒數量（使用快取可顯示更多歷史數據）"
     )
@@ -1966,16 +1977,25 @@ def calculate_ma_crossover_engulfing_signals(df, min_bars=25):
     return trades
 
 # ==================== MA趨勢觸及吞噬策略計算 ====================
-def calculate_ma_trend_engulfing_signals(df, min_bars=25):
+def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤"):
     """
     計算 MA 趨勢觸及吞噬策略信號
 
      規則：
-     1. 趨勢判斷：MA10 與 MA20 同方向（斜率皆 > 0 或皆 < 0）
+     1. 趨勢判斷：MA10 與 MA20 同方向，且 MA10 與 MA20 呈現多空排列
+         - 多頭：MA10_slope > 0、MA20_slope > 0 且 MA10 > MA20
+         - 空頭：MA10_slope < 0、MA20_slope < 0 且 MA10 < MA20
      2. 進場：前一根 K 棒觸及 MA10 或 MA20，且當前 K 棒吞噬前一根
-         - 做多：趨勢向上 + 收盤 > 前一根收盤
-         - 做空：趨勢向下 + 收盤 < 前一根收盤
-    3. 退場：出現反向吞噬即退場（補單=退場）
+         - 做多：趨勢向上 + 收盤 > min(前一根 Open, 前一根 Close) 且 收盤 > 兩條 MA
+         - 做空：趨勢向下 + 收盤 < min(前一根 Open, 前一根 Close) 且 收盤 < 兩條 MA
+     3. 停損 / 退場：
+         - 多頭：若當前 K 棒 Low < min(前一根 Open, 前一根 Close) 視為停損出場
+         - 空頭：若當前 K 棒 High > max(前一根 Open, 前一根 Close) 視為停損出場
+         - 另外，出現反向吞噬時同樣視為出場訊號
+     4. 收盤前 30 分鐘風控：
+         - 每個交易時段（依 session）收盤前 30 分鐘內：
+             • 不再產生新的進場訊號
+             • 若仍有持倉，於觸及「距收盤 30 分鐘」的第一根 K 棒強制平倉
 
     輸出：
         trades: 交易紀錄
@@ -2007,27 +2027,89 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25):
     bars_in_position = 0
     has_added = False
 
+    # 輔助：依 session 判斷每根 K 棒距離收盤時間（Asia/Taipei）
+    def minutes_to_session_close(ts):
+        """計算該時間點距離當日該交易時段收盤還有幾分鐘（負值代表已過收盤）。"""
+        if not hasattr(ts, "tzinfo") or ts.tzinfo is None:
+            taipei_tz = pytz.timezone("Asia/Taipei")
+            ts = taipei_tz.localize(ts)
+        else:
+            ts = ts.astimezone(pytz.timezone("Asia/Taipei"))
+
+        day = ts.date()
+        taipei_tz = pytz.timezone("Asia/Taipei")
+
+        if session == "日盤":
+            close_dt = taipei_tz.localize(datetime(day.year, day.month, day.day, 13, 45))
+        elif session == "夜盤":
+            # 夜盤收盤：次日 05:00
+            next_day = day + timedelta(days=1)
+            close_dt = taipei_tz.localize(datetime(next_day.year, next_day.month, next_day.day, 5, 0))
+        else:
+            # 全盤或其他：依時間自動判斷屬於哪個時段
+            if ts.hour < 12:
+                close_dt = taipei_tz.localize(datetime(day.year, day.month, day.day, 13, 45))
+            else:
+                next_day = day + timedelta(days=1)
+                close_dt = taipei_tz.localize(datetime(next_day.year, next_day.month, next_day.day, 5, 0))
+
+        delta = close_dt - ts
+        return delta.total_seconds() / 60.0
+
     for i in range(1, len(df)):
         row_prev = df.iloc[i - 1]
         row_curr = df.iloc[i]
 
-        uptrend = (row_curr["MA10_slope"] > 0) and (row_curr["MA20_slope"] > 0)
-        downtrend = (row_curr["MA10_slope"] < 0) and (row_curr["MA20_slope"] < 0)
+        # 計算距離收盤時間（分鐘）
+        minutes_left = minutes_to_session_close(df.index[i])
+
+        # 多空排列 + 斜率同向，過濾雜訊以提高勝率
+        uptrend = (
+            row_curr["MA10_slope"] > 0
+            and row_curr["MA20_slope"] > 0
+            and row_curr["MA10"] > row_curr["MA20"]
+        )
+        downtrend = (
+            row_curr["MA10_slope"] < 0
+            and row_curr["MA20_slope"] < 0
+            and row_curr["MA10"] < row_curr["MA20"]
+        )
 
         touch_ma = bool(row_prev["touch_ma10"] or row_prev["touch_ma20"])
-        engulf_up = row_curr["Close"] > row_prev["Close"]
-        engulf_down = row_curr["Close"] < row_prev["Close"]
+
+        # 吞噬定義：
+        # 多頭：收盤 > 前一根 Open/Close 中較低者
+        # 空頭：收盤 < 前一根 Open/Close 中較低者（更嚴格的空方吞噬條件）
+        prev_low_ref = min(row_prev["Open"], row_prev["Close"])
+        prev_high_ref = max(row_prev["Open"], row_prev["Close"])
+        engulf_up = row_curr["Close"] > prev_low_ref
+        engulf_down = row_curr["Close"] < prev_low_ref
+
+        # 收盤前 30 分鐘內：不再開新倉
+        cutoff_reached = minutes_left <= 30
 
         if position is None:
-            # 做多進場
-            if uptrend and touch_ma and engulf_up:
+            # 做多進場：多頭排列 + 前一根碰 MA + 吞噬且收盤站上兩條 MA
+            if (
+                uptrend
+                and touch_ma
+                and engulf_up
+                and row_curr["Close"] > row_curr["MA10"]
+                and row_curr["Close"] > row_curr["MA20"]
+            ) and (not cutoff_reached):
                 position = "LONG"
                 entry_idx = i
                 entry_price = row_curr["Close"]
                 bars_in_position = 1
                 has_added = False
-            # 做空進場
-            elif downtrend and touch_ma and engulf_down:
+            # 做空進場：空頭排列 + 前一根碰 MA + 吞噬且收盤跌破兩條 MA
+            elif (
+                downtrend
+                and touch_ma
+                and engulf_down
+                and row_curr["Close"] < row_curr["MA10"]
+                and row_curr["Close"] < row_curr["MA20"]
+            ) and (not cutoff_reached):
                 position = "SHORT"
                 entry_idx = i
                 entry_price = row_curr["Close"]
@@ -2038,7 +2120,74 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25):
         # 已持倉
         bars_in_position += 1
 
-        # 退場：反向吞噬（補單=退場）
+        # 若已進入收盤前 30 分鐘，強制在第一根觸及時平倉
+        if cutoff_reached and position is not None:
+            exit_idx = i
+            exit_price = row_curr["Close"]
+            trades.append({
+                "entry_idx": entry_idx,
+                "entry_ts": df.index[entry_idx],
+                "entry_price": entry_price,
+                "exit_idx": exit_idx,
+                "exit_ts": df.index[exit_idx],
+                "exit_price": exit_price,
+                "direction": position,
+                "bars_held": bars_in_position,
+                "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+                "exit_reason": "收盤前30分鐘強制平倉",
+            })
+            position = None
+            entry_idx = None
+            entry_price = None
+            bars_in_position = 0
+            continue
+
+        # 停損 & 退場條件
+        # 1) 多頭停損：當前收盤 < 前一根 min(Open, Close)
+        if position == "LONG" and row_curr["Close"] < prev_low_ref:
+            exit_idx = i
+            exit_price = row_curr["Close"]
+            trades.append({
+                "entry_idx": entry_idx,
+                "entry_ts": df.index[entry_idx],
+                "entry_price": entry_price,
+                "exit_idx": exit_idx,
+                "exit_ts": df.index[exit_idx],
+                "exit_price": exit_price,
+                "direction": position,
+                "bars_held": bars_in_position,
+                "pnl": exit_price - entry_price,
+                "exit_reason": "多頭停損(收盤跌破前一根實體低點)",
+            })
+            position = None
+            entry_idx = None
+            entry_price = None
+            bars_in_position = 0
+            continue
+
+        # 2) 空頭停損：當前收盤 > 前一根 max(Open, Close)
+        if position == "SHORT" and row_curr["Close"] > prev_high_ref:
+            exit_idx = i
+            exit_price = row_curr["Close"]
+            trades.append({
+                "entry_idx": entry_idx,
+                "entry_ts": df.index[entry_idx],
+                "entry_price": entry_price,
+                "exit_idx": exit_idx,
+                "exit_ts": df.index[exit_idx],
+                "exit_price": exit_price,
+                "direction": position,
+                "bars_held": bars_in_position,
+                "pnl": entry_price - exit_price,
+                "exit_reason": "空頭停損(收盤突破前一根實體高點)",
+            })
+            position = None
+            entry_idx = None
+            entry_price = None
+            bars_in_position = 0
+            continue
+
+        # 3) 反向吞噬出場（若尚未觸發停損）
         if position == "LONG" and engulf_down:
             exit_idx = i
             exit_price = row_curr["Close"]
@@ -2052,7 +2201,7 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25):
                 "direction": position,
                 "bars_held": bars_in_position,
                 "pnl": exit_price - entry_price,
-                "exit_reason": "反向吞噬(補單=退場)",
+                "exit_reason": "多頭反向吞噬出場",
             })
             position = None
             entry_idx = None
@@ -2073,7 +2222,7 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25):
                 "direction": position,
                 "bars_held": bars_in_position,
                 "pnl": entry_price - exit_price,
-                "exit_reason": "反向吞噬(補單=退場)",
+                "exit_reason": "空頭反向吞噬出場",
             })
             position = None
             entry_idx = None
@@ -2423,7 +2572,7 @@ if df is not None:
     # 5.3.1 繪製策略信號標記
     # ============================================================
     if st.session_state.get("enable_strategy", False):
-        trades, add_events = calculate_ma_trend_engulfing_signals(df)
+        trades, add_events = calculate_ma_trend_engulfing_signals(df, session=session_option)
         
         if trades:
             # 進場信號點
@@ -2502,7 +2651,8 @@ if df is not None:
     # ------------------------------------------------------------
     # 模擬專業看盤軟體的深色風格
     fig.update_layout(
-        xaxis_rangeslider_visible=False,  # 隱藏下方滑動條以節省空間
+        # 開啟下方滑動條，可左右拖曳查看更早/更晚的 K 棒
+        xaxis_rangeslider=dict(visible=True),
         height=900,                       # 圖表高度 900 像素（加大顯示）
         plot_bgcolor='rgb(20, 20, 20)',  # 繪圖區背景色（深灰色）
         paper_bgcolor='rgb(20, 20, 20)', # 整個畫布背景色
@@ -2598,7 +2748,7 @@ if df is not None:
     # 5.6.1 顯示策略交易紀錄
     # ============================================================
     if st.session_state.get("enable_strategy", False):
-        trades, _ = calculate_ma_trend_engulfing_signals(df)
+        trades, _ = calculate_ma_trend_engulfing_signals(df, session=session_option)
         
         if trades:
             with st.expander("📋 交易紀錄", expanded=True):
@@ -2632,12 +2782,21 @@ if df is not None:
                 long_trades = sum(1 for t in trades if t["direction"] == "LONG")
                 short_trades = sum(1 for t in trades if t["direction"] == "SHORT")
                 total_pnl = sum(t["pnl"] for t in trades)
+
+                win_trades = sum(1 for t in trades if t["pnl"] > 0)
+                loss_trades = sum(1 for t in trades if t["pnl"] < 0)
+                win_rate = (win_trades / total_trades * 100) if total_trades > 0 else 0.0
                 
                 col_stats1, col_stats2, col_stats3, col_stats4 = st.columns(4)
                 col_stats1.metric("總交易數", total_trades)
                 col_stats2.metric("做多", long_trades)
                 col_stats3.metric("做空", short_trades)
                 col_stats4.metric("總損益", f"{total_pnl:+.0f}")
+
+                col_stats5, col_stats6, col_stats7 = st.columns(3)
+                col_stats5.metric("獲利筆數", win_trades)
+                col_stats6.metric("虧損筆數", loss_trades)
+                col_stats7.metric("勝率", f"{win_rate:.1f}%")
         else:
             st.info("ℹ️ 未找到符合策略的交易信號，請調整條件或檢查K棒數據")
 
