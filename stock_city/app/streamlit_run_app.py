@@ -1050,12 +1050,30 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
         # 從 database 讀取並組成 K 棒
         df = get_kbars_from_db(interval=interval, session=session, days=days)
 
-        # 若近期資料不足，改用更長回溯天數避免空資料
+        # 若近期資料完全不足，改用更長回溯天數避免空資料
         if df is None or df.empty:
             fallback_days = 1200 if interval == "1d" else 300
             if days < fallback_days:
                 st.sidebar.warning("⚠️ 近期資料不足，改用較長回溯天數查詢...")
                 df = get_kbars_from_db(interval=interval, session=session, days=fallback_days)
+                days = fallback_days
+
+        # 若資料非空但明顯少於滑桿要求（例如僅有結算日 1 天約 57 根 5m K），
+        # 代表最近幾天 DB 可能有缺口，嘗試用更長回溯天數補足可顯示 K 棒數
+        if df is not None and not df.empty and len(df) < max_kbars:
+            for extra_days in [30, 60, 120, 240]:
+                if extra_days <= days:
+                    continue
+                bigger_df = get_kbars_from_db(interval=interval, session=session, days=extra_days)
+                if bigger_df is None or bigger_df.empty:
+                    continue
+                df = bigger_df
+                days = extra_days
+                st.sidebar.warning(
+                    f"⚠️ 最近 {days} 天內可用 K 棒不足，已自動擴大回溯天數至 {extra_days} 天以接近滑桿設定 {max_kbars} 根"
+                )
+                if len(df) >= max_kbars:
+                    break
 
         # ------------------------------------------------------------
         # 自動回填：日K 時若 DB 歷史不足，且已登入 Shioaji，則自動往更早的交易日補齊
@@ -1977,7 +1995,7 @@ def calculate_ma_crossover_engulfing_signals(df, min_bars=25):
     return trades
 
 # ==================== MA趨勢觸及吞噬策略計算 ====================
-def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤"):
+def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_realtime=False):
     """
     計算 MA 趨勢觸及吞噬策略信號
 
@@ -1997,9 +2015,15 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤"):
              • 不再產生新的進場訊號
              • 若仍有持倉，於觸及「距收盤 30 分鐘」的第一根 K 棒強制平倉
 
-    輸出：
-        trades: 交易紀錄
-        add_events: 補單信號列表
+        輸出：
+                trades: 交易紀錄
+                add_events: 補單信號列表
+
+        備註：
+                - 為了回測方便，函數在「非即時模式」下會將最後仍未平倉的部位，
+                    於資料集最後一根 K 棒視為以收盤價強制平倉（exit_reason = "最後一根收盤"）。
+                - 在即時看盤模式（is_realtime=True）下，避免這種回測式強制平倉，
+                    以免造成「最新一根同時出現進場與出場」的視覺混淆。
     """
     if df is None or len(df) < min_bars:
         return [], []
@@ -2230,8 +2254,9 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤"):
             bars_in_position = 0
             continue
 
-    # 若最後仍持倉，強制以最後一根收盤退場
-    if position is not None and entry_idx is not None:
+    # 若最後仍持倉，且為回測模式，強制以最後一根收盤退場
+    # 即時模式 (is_realtime=True) 不執行此步驟，避免最新一根同時出現進/出場標記
+    if (not is_realtime) and position is not None and entry_idx is not None:
         exit_idx = len(df) - 1
         exit_price = df.iloc[exit_idx]["Close"]
         trades.append({
@@ -2319,19 +2344,11 @@ def get_data(interval, product, session, max_kbars, use_shioaji=False, api_insta
 # 4. 主程式執行：獲取數據並限制K棒數量
 # ============================================================
 # 呼叫 get_data 函數獲取 K 線數據（本版一律使用本地 DB 顯示）
-# 核心邏輯：不論是否勾選或登入 Shioaji，都固定讀取 SQLite DB
+# 核心邏輯：圖表永遠從 SQLite DB 讀取顯示；若已登入 Shioaji，會在背景自動更新/回填 DB
 try:
     use_shioaji_flag = st.session_state.get('shioaji_logged_in', False) and 'shioaji_api' in st.session_state
 except:
     use_shioaji_flag = False
-
-# 強制本地 DB 模式（不論是否勾選或登入）
-force_db_only = True
-if force_db_only:
-    if use_shioaji_flag:
-        st.info("ℹ️ 已登入 Shioaji，但目前已鎖定使用本地 SQLite 資料庫顯示")
-    use_shioaji_flag = False
-    st.session_state["use_shioaji_checkbox"] = False
 
 # 如果未成功登入，確保 checkbox 被取消（防止狀態不同步）
 if not use_shioaji_flag:
@@ -2572,7 +2589,7 @@ if df is not None:
     # 5.3.1 繪製策略信號標記
     # ============================================================
     if st.session_state.get("enable_strategy", False):
-        trades, add_events = calculate_ma_trend_engulfing_signals(df, session=session_option)
+        trades, add_events = calculate_ma_trend_engulfing_signals(df, session=session_option, is_realtime=is_realtime)
         
         if trades:
             # 進場信號點
@@ -2748,7 +2765,7 @@ if df is not None:
     # 5.6.1 顯示策略交易紀錄
     # ============================================================
     if st.session_state.get("enable_strategy", False):
-        trades, _ = calculate_ma_trend_engulfing_signals(df, session=session_option)
+        trades, _ = calculate_ma_trend_engulfing_signals(df, session=session_option, is_realtime=is_realtime)
         
         if trades:
             with st.expander("📋 交易紀錄", expanded=True):
