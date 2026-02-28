@@ -35,6 +35,7 @@ from stock_city.db.tick_database import (
 )  # Ticks database 模組
 
 from stock_city.project_paths import get_db_path
+import sqlite3
 
 # ============================================================
 # 1. 頁面初始化設定與 Shioaji 連線
@@ -605,6 +606,252 @@ with st.sidebar:
                 "夜盤": {"count": 0, "start": None, "end": None},
                 "全盤": {"count": 0, "start": None, "end": None},
             }
+
+    @st.cache_data(ttl=60, show_spinner=False)
+    def get_recent_dayk_gaps(session, days_back=10):
+        """自動檢查最近幾個交易日是否有日K缺口（依時段門檻）。"""
+        try:
+            taipei_tz = pytz.timezone('Asia/Taipei')
+            today = datetime.now(taipei_tz).date()
+
+            from stock_city.market.settlement_utils import is_workday
+
+            def get_window(d, sess):
+                if sess == "日盤":
+                    start_local = taipei_tz.localize(datetime(d.year, d.month, d.day, 8, 45, 0))
+                    end_local = taipei_tz.localize(datetime(d.year, d.month, d.day, 13, 46, 0))
+                    threshold = 250
+                elif sess == "夜盤":
+                    start_local = taipei_tz.localize(datetime(d.year, d.month, d.day, 15, 0, 0))
+                    end_local = start_local + timedelta(hours=15)
+                    threshold = 400
+                else:  # 全盤
+                    start_local = taipei_tz.localize(datetime(d.year, d.month, d.day, 0, 0, 0))
+                    end_local = start_local + timedelta(days=1, hours=6)
+                    threshold = 600
+                return start_local, end_local, threshold
+
+            db_path = get_db_path()
+            gaps = []
+
+            conn = sqlite3.connect(str(db_path))
+            cur = conn.cursor()
+
+            checked = 0
+            i = 1
+            while checked < days_back and i <= days_back * 3:
+                d = today - timedelta(days=i)
+                i += 1
+                if not is_workday(d):
+                    continue
+                checked += 1
+                start_local, end_local, threshold = get_window(d, session)
+                start_utc = start_local.astimezone(pytz.UTC).isoformat()
+                end_utc = end_local.astimezone(pytz.UTC).isoformat()
+                cur.execute(
+                    "SELECT COUNT(*) FROM ticks WHERE code=? AND ts >= ? AND ts < ?",
+                    ("TXFR1", start_utc, end_utc),
+                )
+                cnt = int(cur.fetchone()[0] or 0)
+                if cnt < threshold:
+                    gaps.append({
+                        "date": d,
+                        "count": cnt,
+                        "threshold": threshold,
+                    })
+
+            conn.close()
+            return gaps
+        except Exception:
+            return []
+
+    def manual_backfill_recent_dayk(api_instance, session, days_back=10):
+        """手動回填最近幾個交易日的 1 分 K（用於日K彙總），優先修補日盤缺口。
+
+        說明：
+        - 僅在已登入 Shioaji 時使用。
+        - 根據 session 決定時間窗與筆數門檻：
+            日盤：約 08:45-13:45，門檻 250 筆以上；
+            夜盤：約 15:00-05:00，門檻 400 筆以上；
+            全盤：00:00-隔日 06:00，門檻 600 筆以上。
+        - 若發現某個工作日筆數不足，會刪除該窗現有 ticks，
+          再用 api.kbars 回填該日期範圍，並只保留對應時段。
+        """
+        if api_instance is None:
+            st.sidebar.warning("⚠️ 尚未登入 Shioaji，無法回填日K 資料")
+            return
+
+        taipei_tz = pytz.timezone('Asia/Taipei')
+        today = datetime.now(taipei_tz).date()
+
+        from stock_city.market.settlement_utils import is_workday
+
+        def get_window(d, sess):
+            if sess == "日盤":
+                start_local = taipei_tz.localize(datetime(d.year, d.month, d.day, 8, 45, 0))
+                end_local = taipei_tz.localize(datetime(d.year, d.month, d.day, 13, 46, 0))
+                threshold = 250
+            elif sess == "夜盤":
+                start_local = taipei_tz.localize(datetime(d.year, d.month, d.day, 15, 0, 0))
+                end_local = start_local + timedelta(hours=15)
+                threshold = 400
+            else:  # 全盤
+                start_local = taipei_tz.localize(datetime(d.year, d.month, d.day, 0, 0, 0))
+                end_local = start_local + timedelta(days=1, hours=6)
+                threshold = 600
+            return start_local, end_local, threshold
+
+        db_path = get_db_path()
+        to_fill = []
+
+        try:
+            conn = sqlite3.connect(str(db_path))
+            cur = conn.cursor()
+
+            # 往回掃描最近 days_back 個工作日（不含今日），找出筆數不足的日期
+            for i in range(1, days_back + 1):
+                d = today - timedelta(days=i)
+                if not is_workday(d):
+                    continue
+                start_local, end_local, threshold = get_window(d, session)
+                start_utc = start_local.astimezone(pytz.UTC).isoformat()
+                end_utc = end_local.astimezone(pytz.UTC).isoformat()
+                cur.execute(
+                    "SELECT COUNT(*) FROM ticks WHERE code=? AND ts >= ? AND ts < ?",
+                    ("TXFR1", start_utc, end_utc),
+                )
+                cnt = int(cur.fetchone()[0] or 0)
+                if cnt < threshold:
+                    to_fill.append((d, start_local, end_local))
+
+            conn.close()
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ 檢查最近日K 狀態失敗: {str(e)[:120]}")
+            return
+
+        if not to_fill:
+            st.sidebar.info("ℹ️ 最近幾個交易日的日K 已經補齊，無需回填")
+            return
+
+        # 以最小/最大日期決定一次拉取的 kbars 範圍
+        dates_only = [d for d, _, _ in to_fill]
+        range_start = min(dates_only)
+        range_end = max(dates_only) + timedelta(days=1)
+        start = range_start.strftime("%Y-%m-%d")
+        end = range_end.strftime("%Y-%m-%d")
+
+        contract = api_instance.Contracts.Futures.TXF.TXFR1
+        st.sidebar.warning(
+            f"🧩 手動回填：準備回填 {len(to_fill)} 個交易日的 {session} 1分K（區間 {start}~{end}）..."
+        )
+
+        try:
+            kbars = api_instance.kbars(contract=contract, start=start, end=end)
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ Shioaji kbars 請求失敗: {str(e)[:120]}")
+            return
+
+        if not kbars:
+            st.sidebar.warning("⚠️ API 未返回數據，無法回填")
+            return
+
+        df_all = pd.DataFrame({**kbars})
+        if df_all.empty:
+            st.sidebar.warning("⚠️ API 返回空數據，無法回填")
+            return
+
+        df_all["ts"] = pd.to_datetime(df_all["ts"])
+        df_all = df_all.rename(columns={"ts": "datetime"}).sort_values("datetime").reset_index(drop=True)
+        df_all = df_all.set_index("datetime").sort_index()
+
+        def filter_for_session(df_in, target_date, sess):
+            idx = df_in.index
+            next_date = target_date + timedelta(days=1)
+            if sess == "日盤":
+                hours = idx.hour
+                minutes = idx.minute
+                dates = idx.date
+                mask = (dates == target_date) & (
+                    ((hours == 8) & (minutes >= 45))
+                    | ((hours >= 9) & (hours < 13))
+                    | ((hours == 13) & (minutes <= 45))
+                )
+                return df_in.loc[mask]
+            if sess == "夜盤":
+                mask = ((idx.date == target_date) & (idx.hour >= 15)) | (
+                    (idx.date == next_date)
+                    & (
+                        (idx.hour < 5)
+                        | ((idx.hour == 5) & (idx.minute == 0))
+                    )
+                )
+                return df_in.loc[mask]
+            # 全盤
+            mask = (idx.date == target_date) | (
+                (idx.date == next_date)
+                & (
+                    (idx.hour < 5)
+                    | ((idx.hour == 5) & (idx.minute == 0))
+                )
+            )
+            return df_in.loc[mask]
+
+        # 實際寫回 DB
+        total_saved_days = 0
+        for d, start_local, end_local in to_fill:
+            try:
+                # 先刪除該窗內既有 ticks，避免舊資料殘留
+                start_utc = start_local.astimezone(pytz.UTC).isoformat()
+                end_utc = end_local.astimezone(pytz.UTC).isoformat()
+                conn = sqlite3.connect(str(db_path))
+                cur = conn.cursor()
+                cur.execute(
+                    "DELETE FROM ticks WHERE code=? AND ts >= ? AND ts < ?",
+                    ("TXFR1", start_utc, end_utc),
+                )
+                conn.commit()
+                conn.close()
+
+                df_new = filter_for_session(df_all, d, session)
+                if df_new is None or df_new.empty:
+                    continue
+
+                batch_ticks = []
+                for idx, row in df_new.iterrows():
+                    if idx.tzinfo is None:
+                        idx = taipei_tz.localize(idx)
+                    else:
+                        idx = idx.tz_convert(taipei_tz)
+                    batch_ticks.append(
+                        {
+                            'ts': idx,
+                            'code': contract.code,
+                            'open': row.get('Open', row.get('Close', 0)),
+                            'high': row.get('High', row.get('Close', 0)),
+                            'low': row.get('Low', row.get('Close', 0)),
+                            'close': row.get('Close', 0),
+                            'volume': row.get('Volume', 0),
+                            'bid_price': row.get('Close', 0),
+                            'ask_price': row.get('Close', 0),
+                            'bid_volume': 0,
+                            'ask_volume': 0,
+                        }
+                    )
+
+                if batch_ticks:
+                    save_ticks_batch(batch_ticks)
+                    total_saved_days += 1
+            except Exception as e:
+                st.sidebar.warning(f"⚠️ 回填 {d} 失敗: {str(e)[:120]}")
+
+        if total_saved_days > 0:
+            st.sidebar.success(f"✅ 手動回填完成：新增/更新 {total_saved_days} 個交易日的 {session} 1分K（用於日K彙總）")
+            try:
+                get_db_dayk_inventory.clear()
+            except Exception:
+                pass
+        else:
+            st.sidebar.info("ℹ️ 本次未回填到任何交易日，可能 API 範圍內無有效數據")
     
     # 顯示當前設定摘要
     st.info(f"📊 **當前設定**\n- 商品: {product_option}\n- 時段: {session_option}\n- 週期: {interval_option}\n- K棒數: {max_kbars}\n- 自動刷新: {'✅ 啟用' if auto_refresh else '❌ 停用'}")
@@ -628,6 +875,16 @@ with st.sidebar:
                 f"✅ 請先回填：`python backfill_kbars.py --days 500 --session {session_option} --skip-existing`"
             )
 
+        gaps = get_recent_dayk_gaps(session_option, days_back=10)
+        if gaps:
+            st.warning(f"⚠️ 最近 10 個交易日偵測到 {len(gaps)} 個{session_option}日K缺口")
+            gap_list = ", ".join(
+                [f"{g['date']}({g['count']}/{g['threshold']})" for g in gaps]
+            )
+            st.caption(f"🧩 缺口清單：{gap_list}")
+        else:
+            st.caption(f"✅ 最近 10 個交易日 {session_option} 日K 無缺口")
+
     with st.expander("🗄️ DB 日K存量", expanded=False):
         inv = get_db_dayk_inventory()
         for s in ("日盤", "夜盤", "全盤"):
@@ -648,6 +905,18 @@ with st.sidebar:
     # 數據量統計區（會在獲取數據後自動更新）
     if 'data_stats' not in st.session_state:
         st.session_state['data_stats'] = {}
+
+    # 手動強制回填最近日K（依當前選擇的時段）
+    if logged_in:
+        if st.button("🔁 強制回填最近日K (含日盤缺口)", use_container_width=True):
+            api_instance = st.session_state.get('shioaji_api')
+            if api_instance is None:
+                st.warning("⚠️ 尚未登入 Shioaji，無法回填日K 資料")
+            else:
+                try:
+                    manual_backfill_recent_dayk(api_instance, session_option, days_back=10)
+                except Exception as e:
+                    st.warning(f"⚠️ 手動回填日K 失敗: {str(e)[:120]}")
 
 # ============================================================
 # 4. 數據獲取與處理 (Data Handler)
@@ -936,13 +1205,33 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
 
                     need_update = missing_evening or too_old
                 else:
-                    # 日盤：沿用「今日」判斷
+                    # 日盤：更嚴謹判斷「今天是否有開盤」以及「是否已補到收盤」
                     latest_ts = get_latest_tick_timestamp(code='TXFR1', date=today)
                     need_update = latest_ts is None
-                    if not need_update and market_is_open:
-                        # 開盤中若資料超過 2 分鐘未更新則重新抓取
-                        if latest_ts < now - timedelta(minutes=2):
-                            need_update = True
+
+                    if latest_ts is not None:
+                        # 將 DB 最新時間轉成台北時間，便於和 now / 收盤時間比較
+                        latest_local = latest_ts
+                        try:
+                            if getattr(latest_local, 'tzinfo', None) is None:
+                                latest_local = pytz.UTC.localize(latest_local).astimezone(taipei_tz)
+                            else:
+                                latest_local = latest_local.astimezone(taipei_tz)
+                        except Exception:
+                            latest_local = latest_ts
+
+                        # 預期的日盤收盤時間（含結算日 13:30 也會在 13:45 前落在此區間內）
+                        day_close_dt = taipei_tz.localize(datetime(today.year, today.month, today.day, 13, 45))
+
+                        if market_is_open:
+                            # 今天有開盤：要求 DB 最新時間與現在落差不得超過 2 分鐘
+                            if latest_local < now - timedelta(minutes=2):
+                                need_update = True
+                        else:
+                            # 今天已收盤或尚未開盤：
+                            # 若為平日且理論上有日盤，且 DB 最新時間仍落在收盤前很早的位置，視為尚未補齊到收盤
+                            if today.weekday() < 5 and latest_local < day_close_dt:
+                                need_update = True
                 
                 if not need_update:
                     return
@@ -1109,7 +1398,7 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                 # 每次最多回填 N 個交易日，避免一次卡太久（可透過多次刷新逐步補齊）
                 max_days_per_run = 30
 
-                # 從目前資料最早日往前補（比從今天往回更有效）
+                # 從目前資料最早日往前補為主，同時也檢查「最近幾個交易日」是否有缺（例如 2/25、2/26 日盤遺漏）
                 taipei_tz = pytz.timezone('Asia/Taipei')
                 if current_df is not None and not current_df.empty:
                     try:
@@ -1119,10 +1408,18 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                         else:
                             earliest_dt = earliest_dt.tz_convert(taipei_tz)
                         cursor_date = earliest_dt.date() - timedelta(days=1)
+                        latest_dt = current_df.index.max()
+                        if getattr(latest_dt, 'tzinfo', None) is None:
+                            latest_dt = taipei_tz.localize(latest_dt)
+                        else:
+                            latest_dt = latest_dt.tz_convert(taipei_tz)
+                        latest_date = latest_dt.date()
                     except Exception:
                         cursor_date = datetime.now(taipei_tz).date()
+                        latest_date = None
                 else:
                     cursor_date = datetime.now(taipei_tz).date()
+                    latest_date = None
 
                 from stock_city.market.settlement_utils import is_workday
 
@@ -1240,13 +1537,35 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                 to_fill = []
                 checked_days = 0
                 max_checks = target_days * 8  # 避免遇到一堆非工作日/無資料日卡死
+
+                # 1) 優先檢查「最近幾個工作日」是否缺資料（例如日盤只到 2/24，優先處理 2/25、2/26）
+                if latest_date is not None:
+                    forward_date = latest_date + timedelta(days=1)
+                    today = datetime.now(taipei_tz).date()
+                    last_candidate = today - timedelta(days=1)  # 今天交給 update_today_kbars_if_needed 負責
+
+                    while (
+                        forward_date <= last_candidate
+                        and len(to_fill) < target_days
+                        and checked_days < max_checks * 2
+                    ):
+                        if not is_workday(forward_date):
+                            forward_date += timedelta(days=1)
+                            continue
+                        checked_days += 1
+                        if not has_sufficient_data_local(forward_date, session):
+                            to_fill.append(forward_date)
+                        forward_date += timedelta(days=1)
+
+                # 2) 若還有名額，再從目前資料最早日往前找「更早」但尚未補齊的交易日
                 scan_date = cursor_date
                 while len(to_fill) < target_days and checked_days < max_checks:
                     if not is_workday(scan_date):
                         scan_date -= timedelta(days=1)
                         continue
                     checked_days += 1
-                    if not has_sufficient_data_local(scan_date, session):
+                    # 避免重複加入已在 to_fill 的日期
+                    if not has_sufficient_data_local(scan_date, session) and scan_date not in to_fill:
                         to_fill.append(scan_date)
                     scan_date -= timedelta(days=1)
 
@@ -1879,120 +2198,6 @@ def apply_realtime_snapshot_to_kbars(df: pd.DataFrame, interval: str, latest_pri
         df.loc[:, "MA20"] = df["Close"].rolling(window=20).mean()
 
     return df
-
-# ==================== MA交叉吞噬策略計算 ====================
-def calculate_ma_crossover_engulfing_signals(df, min_bars=25):
-    """
-    計算 MA 交叉吞噬策略信號
-    
-    規則：
-    1. 檢測 MA10 和 MA20 都向上趨勢（MA 斜率 > 0）
-    2. 進場信號：K 棒碰到 MA10 或 MA20，且下一根 K 棒吞噬（Close[i] > Close[i-1]）
-    3. 加碼信號：最新 K 棒吞噬前一根（Close[i] > Close[i-1]）
-    4. 退場信號：相反邏輯（K 棒碰到 MA，下一根下跌）
-    
-    輸入：
-        df: DataFrame with 'Open', 'High', 'Low', 'Close', 'Volume', 'MA10', 'MA20'
-        min_bars: 最少需要的K棒數（預設25，確保MA計算有效）
-    
-    輸出：
-        trades: List of trade dicts with keys: 
-            'entry_idx', 'entry_price', 'exit_idx', 'exit_price', 'direction', 'bars_held'
-    """
-    if df is None or len(df) < min_bars:
-        return []
-    
-    df = df.copy()
-    trades = []
-    
-    # 確保有 MA10/MA20
-    if "MA10" not in df.columns or "MA20" not in df.columns:
-        df["MA10"] = df["Close"].rolling(window=10).mean()
-        df["MA20"] = df["Close"].rolling(window=20).mean()
-    
-    # 計算 MA 斜率（用簡單差分表示趨勢）
-    df["MA10_slope"] = df["MA10"].diff()
-    df["MA20_slope"] = df["MA20"].diff()
-    
-    # 偵測是否 K 棒「碰到」MA（touch）
-    # 定義：Low <= MA <= High（觸及範圍內）
-    df["touch_ma10"] = (df["Low"] <= df["MA10"]) & (df["MA10"] <= df["High"])
-    df["touch_ma20"] = (df["Low"] <= df["MA20"]) & (df["MA20"] <= df["High"])
-    
-    # 偵測吞噬信號：Close[i] > Close[i-1]
-    df["is_engulfing"] = df["Close"] > df["Close"].shift(1)
-    
-    # 追蹤當前部位（None, 'LONG', 'SHORT'）
-    position = None
-    entry_idx = None
-    entry_price = None
-    bars_in_position = 0
-    
-    for i in range(2, len(df)):  # 從第3根開始（前2根用於計算斜率和吞噬）
-        row_prev = df.iloc[i-1]
-        row_curr = df.iloc[i]
-        
-        # 檢查趨勢（MA10 和 MA20 都向上）
-        uptrend = (row_curr["MA10_slope"] > 0) and (row_curr["MA20_slope"] > 0)
-        downtrend = (row_curr["MA10_slope"] < 0) and (row_curr["MA20_slope"] < 0)
-        
-        # 進場邏輯：前一根碰到 MA + 當前根吞噬
-        touch_ma = row_prev["touch_ma10"] or row_prev["touch_ma20"]
-        engulfing = row_curr["is_engulfing"]
-        
-        # 做多進場：趨勢向上 + 碰 MA + 吞噬
-        if position is None and uptrend and touch_ma and engulfing:
-            position = "LONG"
-            entry_idx = i
-            entry_price = row_curr["Close"]
-            bars_in_position = 1
-        
-        # 做空進場：趨勢向下 + 碰 MA + 反向吞噬
-        elif position is None and downtrend and touch_ma and (not engulfing):
-            position = "SHORT"
-            entry_idx = i
-            entry_price = row_curr["Close"]
-            bars_in_position = 1
-        
-        # 加碼邏輯：當前根吞噬前一根（維持部位方向）
-        elif position == "LONG" and engulfing:
-            bars_in_position += 1
-        
-        elif position == "SHORT" and (not engulfing):
-            bars_in_position += 1
-        
-        # 退場邏輯：反向吞噬或趨勢改變
-        elif position is not None:
-            exit_signal = False
-            
-            if position == "LONG":
-                # 做多退場：K棒碰MA + 下一根下跌（反向吞噬）
-                if touch_ma and (not engulfing):
-                    exit_signal = True
-            
-            else:  # SHORT
-                # 做空退場：K棒碰MA + 下一根上漲（反向吞噬）
-                if touch_ma and engulfing:
-                    exit_signal = True
-            
-            if exit_signal:
-                trades.append({
-                    "entry_idx": entry_idx,
-                    "entry_ts": df.index[entry_idx],
-                    "entry_price": entry_price,
-                    "exit_idx": i,
-                    "exit_ts": df.index[i],
-                    "exit_price": row_curr["Close"],
-                    "direction": position,
-                    "bars_held": bars_in_position,
-                    "pnl": (row_curr["Close"] - entry_price) if position == "LONG" else (entry_price - row_curr["Close"]),
-                })
-                position = None
-                entry_idx = None
-                entry_price = None
-                bars_in_position = 0
-    
-    return trades
 
 # ==================== MA趨勢觸及吞噬策略計算 ====================
 def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_realtime=False):
