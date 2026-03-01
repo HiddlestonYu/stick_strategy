@@ -3,7 +3,7 @@
 =====================================================
 本程式提供台指期貨、台積電和台灣加權指數的 K 線圖表分析工具
 支援多時段切換（日盤/夜盤/全盤）、多週期 K 線（1分-日線）
-並包含移動平均線（MA10/MA20）技術指標
+並包含移動平均線（MA20/MA60）技術指標
 
 作者: AI Assistant
 版本: 3.0 - 使用 Shioaji API
@@ -44,7 +44,7 @@ import sqlite3
 st.set_page_config(layout="wide", page_title="台指期程式交易看盤室")
 
 # 顯示主標題
-st.title("📈 台指期全盤 K線圖 (含 10MA/20MA)")
+st.title("📈 台指期全盤 K線圖 (含 20MA/60MA)")
 
 # 初始化 Shioaji API
 @st.cache_resource
@@ -563,12 +563,12 @@ with st.sidebar:
             strategy_type = st.selectbox(
                 "選擇策略類型",
                 ("MA交叉吞噬策略",),  # 未來可擴展更多策略
-                help="MA交叉吞噬策略：檢測MA10/MA20都向上趨勢時，在碰MA且下一根吞噬時進場"
+                help="MA交叉吞噬策略：檢測MA20/MA60都向上趨勢時，在碰MA且下一根吞噬時進場"
             )
             st.session_state["strategy_type"] = strategy_type
             st.info(
                 "📌 **策略規則**\n\n"
-                "• **進場**：MA10+MA20都向上 → K棒碰MA → 下一根吞噬（Close > 前Close） → 進場做多\n"
+                "• **進場**：MA20+MA60都向上 → 前一根站上/站下MA20 → 下一根吞噬 → 進場\n"
                 "• **加碼**：最新K棒吞噬前一根\n"
                 "• **做空**：反向邏輯（趨勢向下 → 碰MA → 反向吞噬）\n"
                 "• **退場**：相反信號出現時清倉"
@@ -2122,8 +2122,8 @@ def process_kline_data(df, interval, session):
     # 計算技術指標
     # ------------------------------------------------------------
     df = df.copy()  # 避免 SettingWithCopyWarning
-    df.loc[:, 'MA10'] = df['Close'].rolling(window=10).mean()
     df.loc[:, 'MA20'] = df['Close'].rolling(window=20).mean()
+    df.loc[:, 'MA60'] = df['Close'].rolling(window=60).mean()
     
     return df
 
@@ -2194,8 +2194,8 @@ def apply_realtime_snapshot_to_kbars(df: pd.DataFrame, interval: str, latest_pri
 
     # 重新計算均線（只要最後一根正確即可，成本也不高）
     if "Close" in df.columns:
-        df.loc[:, "MA10"] = df["Close"].rolling(window=10).mean()
         df.loc[:, "MA20"] = df["Close"].rolling(window=20).mean()
+        df.loc[:, "MA60"] = df["Close"].rolling(window=60).mean()
 
     return df
 
@@ -2205,12 +2205,12 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
     計算 MA 趨勢觸及吞噬策略信號
 
      規則：
-     1. 趨勢判斷：MA10 與 MA20 同方向，且 MA10 與 MA20 呈現多空排列
-         - 多頭：MA10_slope > 0、MA20_slope > 0 且 MA10 > MA20
-         - 空頭：MA10_slope < 0、MA20_slope < 0 且 MA10 < MA20
-     2. 進場：前一根 K 棒觸及 MA10 或 MA20，且當前 K 棒吞噬前一根
-         - 做多：趨勢向上 + 收盤 > min(前一根 Open, 前一根 Close) 且 收盤 > 兩條 MA
-         - 做空：趨勢向下 + 收盤 < min(前一根 Open, 前一根 Close) 且 收盤 < 兩條 MA
+     1. 趨勢判斷：MA20 與 MA60 同方向，且 MA20 與 MA60 呈現多空排列
+         - 多頭：MA20_slope > 0、MA60_slope > 0 且 MA20 > MA60
+         - 空頭：MA20_slope < 0、MA60_slope < 0 且 MA20 < MA60
+     2. 進場：第 N 根 K 棒站上/站下 MA20，且第 N+1 根收盤吞噬前一根
+         - 做多：趨勢向上 + N 根收盤站上 MA20 + N+1 收盤 > 前一根 max(Open, Close) 且 收盤 > 兩條 MA
+         - 做空：趨勢向下 + N 根收盤站下 MA20 + N+1 收盤 < 前一根 min(Open, Close) 且 收盤 < 兩條 MA
      3. 停損 / 退場：
          - 多頭：若當前 K 棒 Low < min(前一根 Open, 前一根 Close) 視為停損出場
          - 空頭：若當前 K 棒 High > max(前一根 Open, 前一根 Close) 視為停損出場
@@ -2237,18 +2237,18 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
     trades = []
     add_events = []
 
-    # 確保有 MA10/MA20
-    if "MA10" not in df.columns or "MA20" not in df.columns:
-        df["MA10"] = df["Close"].rolling(window=10).mean()
+    # 確保有 MA20/MA60
+    if "MA20" not in df.columns or "MA60" not in df.columns:
         df["MA20"] = df["Close"].rolling(window=20).mean()
+        df["MA60"] = df["Close"].rolling(window=60).mean()
 
     # 計算 MA 斜率（用簡單差分表示趨勢）
-    df["MA10_slope"] = df["MA10"].diff()
     df["MA20_slope"] = df["MA20"].diff()
+    df["MA60_slope"] = df["MA60"].diff()
 
     # 偵測是否 K 棒「碰到」MA（touch）
-    df["touch_ma10"] = (df["Low"] <= df["MA10"]) & (df["MA10"] <= df["High"])
     df["touch_ma20"] = (df["Low"] <= df["MA20"]) & (df["MA20"] <= df["High"])
+    df["touch_ma60"] = (df["Low"] <= df["MA60"]) & (df["MA60"] <= df["High"])
 
     position = None
     entry_idx = None
@@ -2294,24 +2294,25 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
 
         # 多空排列 + 斜率同向，過濾雜訊以提高勝率
         uptrend = (
-            row_curr["MA10_slope"] > 0
-            and row_curr["MA20_slope"] > 0
-            and row_curr["MA10"] > row_curr["MA20"]
+            row_curr["MA20_slope"] > 0
+            and row_curr["MA60_slope"] > 0
+            and row_curr["MA20"] > row_curr["MA60"]
         )
         downtrend = (
-            row_curr["MA10_slope"] < 0
-            and row_curr["MA20_slope"] < 0
-            and row_curr["MA10"] < row_curr["MA20"]
+            row_curr["MA20_slope"] < 0
+            and row_curr["MA60_slope"] < 0
+            and row_curr["MA20"] < row_curr["MA60"]
         )
 
-        touch_ma = bool(row_prev["touch_ma10"] or row_prev["touch_ma20"])
+        prev_stand_above_ma20 = row_prev["Close"] > row_prev["MA20"]
+        prev_stand_below_ma20 = row_prev["Close"] < row_prev["MA20"]
 
         # 吞噬定義：
-        # 多頭：收盤 > 前一根 Open/Close 中較低者
-        # 空頭：收盤 < 前一根 Open/Close 中較低者（更嚴格的空方吞噬條件）
+        # 多頭：收盤 > 前一根 max(Open, Close)
+        # 空頭：收盤 < 前一根 min(Open, Close)
         prev_low_ref = min(row_prev["Open"], row_prev["Close"])
         prev_high_ref = max(row_prev["Open"], row_prev["Close"])
-        engulf_up = row_curr["Close"] > prev_low_ref
+        engulf_up = row_curr["Close"] > prev_high_ref
         engulf_down = row_curr["Close"] < prev_low_ref
 
         # 收盤前 30 分鐘內：不再開新倉
@@ -2321,10 +2322,10 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
             # 做多進場：多頭排列 + 前一根碰 MA + 吞噬且收盤站上兩條 MA
             if (
                 uptrend
-                and touch_ma
+                and prev_stand_above_ma20
                 and engulf_up
-                and row_curr["Close"] > row_curr["MA10"]
                 and row_curr["Close"] > row_curr["MA20"]
+                and row_curr["Close"] > row_curr["MA60"]
             ) and (not cutoff_reached):
                 position = "LONG"
                 entry_idx = i
@@ -2334,10 +2335,10 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
             # 做空進場：空頭排列 + 前一根碰 MA + 吞噬且收盤跌破兩條 MA
             elif (
                 downtrend
-                and touch_ma
+                and prev_stand_below_ma20
                 and engulf_down
-                and row_curr["Close"] < row_curr["MA10"]
                 and row_curr["Close"] < row_curr["MA20"]
+                and row_curr["Close"] < row_curr["MA60"]
             ) and (not cutoff_reached):
                 position = "SHORT"
                 entry_idx = i
@@ -2643,8 +2644,8 @@ else:
 if df is not None:
     original_count = len(df)
     
-    # 計算所需的最大窗口（MA20 需要 20 筆）
-    ma_window = 20
+    # 計算所需的最大窗口（MA60 需要 60 筆）
+    ma_window = 60
     
     # 如果數據量大於需要顯示的數量，先保留足夠計算 MA 的數據
     if original_count > max_kbars:
@@ -2662,8 +2663,8 @@ if df is not None:
         
         # 重新計算 MA（確保完整）
         df_for_calc = df_for_calc.copy()
-        df_for_calc['MA10'] = df_for_calc['Close'].rolling(window=10).mean()
         df_for_calc['MA20'] = df_for_calc['Close'].rolling(window=20).mean()
+        df_for_calc['MA60'] = df_for_calc['Close'].rolling(window=60).mean()
         
         # 最後只取需要顯示的部分
         df = df_for_calc.tail(max_kbars)
@@ -2762,30 +2763,30 @@ if df is not None:
     # ------------------------------------------------------------
     # 5.3 繪製移動平均線 (MA)
     # ------------------------------------------------------------
-    # 繪製 10 日移動平均線（橘色）
-    fig.add_trace(
-        go.Scatter(
-            x=x_range,  # 使用連續數字索引
-            y=df['MA10'], 
-            line=dict(color='orange', width=1.5), 
-            name='10 MA',
-            text=date_labels,
-            hovertext=date_labels,
-            hovertemplate='<b>%{text}</b><br>MA10: %{y:.0f}<extra></extra>'
-        ), 
-        row=1, col=1
-    )
-    
-    # 繪製 20 日移動平均線（紫色）
+    # 繪製 20 日移動平均線（橘色）
     fig.add_trace(
         go.Scatter(
             x=x_range,  # 使用連續數字索引
             y=df['MA20'], 
-            line=dict(color='purple', width=1.5), 
+            line=dict(color='orange', width=1.5), 
             name='20 MA',
             text=date_labels,
             hovertext=date_labels,
             hovertemplate='<b>%{text}</b><br>MA20: %{y:.0f}<extra></extra>'
+        ), 
+        row=1, col=1
+    )
+    
+    # 繪製 60 日移動平均線（紫色）
+    fig.add_trace(
+        go.Scatter(
+            x=x_range,  # 使用連續數字索引
+            y=df['MA60'], 
+            line=dict(color='purple', width=1.5), 
+            name='60 MA',
+            text=date_labels,
+            hovertext=date_labels,
+            hovertemplate='<b>%{text}</b><br>MA60: %{y:.0f}<extra></extra>'
         ), 
         row=1, col=1
     )
@@ -2961,7 +2962,7 @@ if df is not None:
     # 5.6.0 策略選擇（K 線圖下方）
     # ------------------------------------------------------------
     st.checkbox(
-        "策略選擇：10/20MA 趨勢 + 觸及 + 吞噬（進場/補單）",
+        "策略選擇：20/60MA 趨勢 + 觸及 + 吞噬（進場/補單）",
         value=st.session_state.get("enable_strategy", False),
         key="enable_strategy",
         help="趨勢同向時，K棒觸及 MA 且下一根吞噬即進場；持倉期間同向吞噬補單，反向吞噬退場"
@@ -3034,8 +3035,8 @@ if df is not None:
     
     # 在各欄位中顯示指標（使用 metric 組件）
     col1.metric("最新收盤", f"{last_row['Close']:.0f}")  # 最新收盤價
-    col2.metric("10 MA", f"{last_row['MA10']:.0f}")           # 10日均線
-    col3.metric("20 MA", f"{last_row['MA20']:.0f}")           # 20日均線
+    col2.metric("20 MA", f"{last_row['MA20']:.0f}")           # 20日均線
+    col3.metric("60 MA", f"{last_row['MA60']:.0f}")           # 60日均線
     col4.metric("成交量", f"{last_row['Volume']:.0f}")        # 成交量
     
     # 顯示自動更新提示與即時數據
