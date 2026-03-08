@@ -35,6 +35,7 @@ from stock_city.db.tick_database import (
 )  # Ticks database 模組
 
 from stock_city.project_paths import get_db_path
+from stock_city.strategy.ma20_ma60 import calculate_ma_trend_engulfing_signals
 import sqlite3
 
 # ============================================================
@@ -568,7 +569,7 @@ with st.sidebar:
             st.session_state["strategy_type"] = strategy_type
             st.info(
                 "📌 **策略規則**\n\n"
-                "• **進場**：MA20+MA60都向上 → 前一根站上/站下MA20 → 下一根吞噬 → 進場\n"
+                "• **進場**：MA20+MA60都向上 → 前一根觸及MA20 → 下一根吞噬 → 進場\n"
                 "• **加碼**：最新K棒吞噬前一根\n"
                 "• **做空**：反向邏輯（趨勢向下 → 碰MA → 反向吞噬）\n"
                 "• **退場**：相反信號出現時清倉"
@@ -1660,290 +1661,7 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
             # 回填後重新讀一次 DB，讓滑桿「真的連動」到更多日K
             df = get_kbars_from_db(interval=interval, session=session, days=days)
 
-        if interval == "1d" and _api is not None and df is not None and not df.empty and len(df) < max_kbars:
-            st.sidebar.caption(
-                f"⏳ 自動回填進行中：目前可顯示 {len(df)}/{max_kbars} 根（日K）。"
-                " 系統會分批補齊，請保持頁面開啟。"
-            )
-        
-        if df is None or df.empty:
-            st.sidebar.warning("⚠️ Database 無數據")
-            st.sidebar.caption("💡 提示：需要先訂閱 ticks 並接收數據")
-            
-            # 顯示詳細調試信息
-            try:
-                import sqlite3
-                db_path = get_db_path()
-                conn = sqlite3.connect(str(db_path))
-                cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM ticks")
-                total = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(DISTINCT code) FROM ticks")
-                codes = cursor.fetchone()[0]
-                cursor.execute("SELECT DISTINCT code FROM ticks LIMIT 5")
-                code_list = [row[0] for row in cursor.fetchall()]
-                st.sidebar.caption(f"📊 Database info: {total} ticks, {codes} codes: {code_list}")
-                if total > 0:
-                    cursor.execute("SELECT MIN(date(ts)), MAX(date(ts)) FROM ticks")
-                    dates = cursor.fetchone()
-                    st.sidebar.caption(f"📅 Date range: {dates[0]} ~ {dates[1]}")
-                conn.close()
-            except Exception as e:
-                st.sidebar.caption(f"Debug error: {e}")
-            
-            return None
-        
-        st.sidebar.success(f"✅ 從 Database 讀取 {len(df)} 筆 {interval}K")
-        st.sidebar.caption(f"📅 數據範圍: {df.index[0].date()} ~ {df.index[-1].date()}")
-
-        # 若使用者想看更多日K，但資料庫歷史不足，提示如何預先回填
-        if interval == "1d" and len(df) < max_kbars:
-            backfill_cmd = f"python backfill_kbars.py --days 500 --session {session} --skip-existing"
-            extra_note = ""
-            if session == "夜盤":
-                extra_note = "\n💡 夜盤日K 需要先回填『夜盤 1分K』，只回填日盤會導致夜盤日K根數很少。"
-            elif session == "全盤":
-                extra_note = "\n💡 全盤若要包含夜盤跨日的完整走勢，建議用『全盤』回填（會同時補齊夜盤段）。"
-
-            st.sidebar.warning(
-                f"⚠️ 日K 歷史不足：目前只有 {len(df)} 根，無法滿足滑桿 {max_kbars} 根。\n"
-                f"💡 可先預先回填歷史資料（例如 500 天）：\n`{backfill_cmd}`"
-                f"{extra_note}"
-            )
-        
-        # 顯示最近3日數據（調試用）
-        if interval == "1d" and len(df) > 0:
-            st.sidebar.caption("📊 最近3日數據：")
-            for idx in df.index[-3:]:
-                row = df.loc[idx]
-                date_str = idx.strftime('%Y/%m/%d')
-                st.sidebar.caption(f"{date_str}: 開{row['Open']:.0f} 高{row['High']:.0f} 低{row['Low']:.0f} 收{row['Close']:.0f}")
-        
-        return df
-        
-    except Exception as e:
-        st.sidebar.error(f"❌ 數據讀取失敗: {str(e)}")
-        import traceback
-        st.sidebar.caption(f"詳細錯誤：{traceback.format_exc()[:200]}")
-        return None
-    """
-    從 Shioaji API 獲取 K 線數據（即時更新）+ 本地快取
-    
-    策略：
-    1. 讀取本地快取（如果有）
-    2. 下載最新數據
-    3. 合併並更新快取
-    4. 返回完整數據
-    
-    注意：不使用 @st.cache_data，因為會影響本地快取累積
-    
-    參數:
-        _api: Shioaji API 實例（前綴 _ 避免被快取）
-        interval (str): K 線週期
-        product (str): 商品名稱
-        session (str): 交易時段
-        
-    返回:
-        pd.DataFrame: K 線數據
-    """
-    try:
-        # 1. 讀取本地快取
-        cached_df, last_update = load_cache(product, interval, session)
-        
-        if cached_df is not None and not cached_df.empty:
-            st.sidebar.caption(f"💾 載入快取: {len(cached_df)} 筆歷史數據")
-            st.sidebar.caption(f"📅 快取範圍: {cached_df.index[0].date()} ~ {cached_df.index[-1].date()}")
-            if last_update:
-                st.sidebar.caption(f"🕐 快取更新: {last_update.strftime('%Y-%m-%d %H:%M')}")
-            
-            # 如果快取數據較少，提示可以回溯下載
-            if len(cached_df) < 100:
-                st.sidebar.info(f"💡 快取僅 {len(cached_df)} 筆，可多次重新整理頁面累積數據")
-        else:
-            st.sidebar.caption(f"ℹ️ 無本地快取，首次下載")
-        
-        # 2. 獲取合約
-        contracts = get_contract(_api, product)
-        if contracts is None:
-            st.warning("⚠️ 無法獲取合約，請確認已登入並下載合約資料")
-            return None
-        
-        # 檢查是否為多合約（期貨需要拼接）- 現在改為單一合約模式
-        if isinstance(contracts, list):
-            # 歷史多合約拼接模式（已停用，改用單一最近月份合約）
-            st.sidebar.warning("⚠️ 檢測到多合約模式，已切換為單一合約模式以獲取即時數據")
-            contracts = contracts[0] if contracts else None
-            if not contracts:
-                st.sidebar.error("❌ 無可用合約")
-                return None
-        
-        # 單一合約模式（期貨或股票）
-        contract = contracts
-        
-        # 設定時間範圍 - 即時數據使用更短時間範圍
-        taipei_tz = pytz.timezone('Asia/Taipei')
-        end_date = datetime.now(taipei_tz)
-        
-        # 特別處理：日K + 指定時段 = 下載分鐘K後彙總
-        download_minute_for_daily = (interval == "1d" and session in ["日盤", "夜盤"])
-        
-        if download_minute_for_daily:
-            # 下載15分鐘K（而非1分鐘K），用於精確過濾時段
-            # 15分鐘K的歷史數據較多，可獲得更長期的數據
-            st.sidebar.caption(f"⚙️ 正在下載15分K以彙總{session}日K...")
-            start_date = end_date - timedelta(days=360)  # 嘗試下載360天
-            actual_interval = "15m"  # 使用15分鐘K（歷史數據較1分鐘K豐富）
-        elif interval == "1d":
-            # 日K取近30天（全盤模式）
-            start_date = end_date - timedelta(days=30)
-            actual_interval = interval
-        elif interval in ["30m", "60m"]:
-            # 60分/30分K取近3天（確保包含夜盤）
-            start_date = end_date - timedelta(days=3)
-            actual_interval = interval
-        elif interval == "15m":
-            # 15分K取近2天
-            start_date = end_date - timedelta(days=2)
-            actual_interval = interval
-        else:
-            # 1分/5分K取近12小時（包含夜盤）
-            start_date = end_date - timedelta(hours=12)
-            actual_interval = interval
-        
-        st.sidebar.caption(f"🔍 合約: {contract.code}")
-        st.sidebar.caption(f"📅 時間範圍: {start_date.strftime('%Y-%m-%d %H:%M')} ~ {end_date.strftime('%Y-%m-%d %H:%M')}")
-        st.sidebar.caption(f"⏱️ 請求週期: {actual_interval}")
-        st.sidebar.caption(f"🕐 台灣時間: {end_date.strftime('%H:%M:%S')}")
-        
-        try:
-            # 構建 kbars 參數
-            kbars_params = {
-                'contract': contract,
-                'start': start_date.strftime("%Y-%m-%d"),
-                'end': end_date.strftime("%Y-%m-%d")
-            }
-            
-            # 根據週期設定 timeout（分鐘K需要較長時間）
-            if actual_interval in ["1m", "5m"]:
-                timeout_seconds = 30
-            else:
-                timeout_seconds = 10
-            
-            st.sidebar.caption(f"🔄 正在下載 {actual_interval} K線數據...")
-            
-            kbars = _api.kbars(**kbars_params)
-        except Exception as kbar_error:
-            error_msg = str(kbar_error)
-            st.sidebar.error(f"❌ kbars API 錯誤: {error_msg[:200]}")
-            
-            # 如果是 404 錯誤，嘗試更短的時間範圍
-            if "404" in error_msg or "not found" in error_msg.lower():
-                st.sidebar.warning("⚠️ 嘗試使用更短時間範圍...")
-                start_date = end_date - timedelta(days=1)
-                st.sidebar.caption(f"🔄 重試: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
-                
-                try:
-                    retry_params = {
-                        'contract': contract,
-                        'start': start_date.strftime("%Y-%m-%d"),
-                        'end': end_date.strftime("%Y-%m-%d")
-                    }
-                    kbars = _api.kbars(**retry_params)
-                except Exception as retry_error:
-                    st.sidebar.error(f"❌ 重試失敗: {str(retry_error)[:200]}")
-                    return None
-            else:
-                return None
-        
-        # 轉換為 DataFrame
-        if kbars is not None:
-            try:
-                df = pd.DataFrame({**kbars})
-                
-                if df.empty:
-                    st.warning("⚠️ Shioaji 返回空數據")
-                    st.sidebar.error(f"❌ 合約: {contract.code}, 時間: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
-                    return None
-                
-                raw_count = len(df)
-                st.sidebar.caption(f"📥 Shioaji API 返回 {raw_count} 筆原始數據")
-                # 設定時間索引（先不顯示範圍，因為時區可能不正確）
-                df['ts'] = pd.to_datetime(df['ts'])
-                
-                # 檢查時區並轉換為台灣時間
-                if df['ts'].dt.tz is None:
-                    # 如果是 naive datetime，假設 Shioaji 返回的是 UTC+0
-                    df['ts'] = df['ts'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei')
-                    st.sidebar.caption("🌍 時區: UTC → Asia/Taipei")
-                else:
-                    # 如果已有時區，轉換為台灣時間
-                    df['ts'] = df['ts'].dt.tz_convert('Asia/Taipei')
-                    st.sidebar.caption(f"🌍 時區: {df['ts'].dt.tz} → Asia/Taipei")
-                
-                df = df.set_index('ts')
-                st.sidebar.caption(f"📅 API 數據範圍: {df.index[0]} ~ {df.index[-1]}")
-                
-                # 標準化欄位名稱（檢查欄位是否存在）
-                rename_map = {}
-                if 'open' in df.columns:
-                    rename_map['open'] = 'Open'
-                if 'high' in df.columns:
-                    rename_map['high'] = 'High'
-                if 'low' in df.columns:
-                    rename_map['low'] = 'Low'
-                if 'close' in df.columns:
-                    rename_map['close'] = 'Close'
-                if 'volume' in df.columns:
-                    rename_map['volume'] = 'Volume'
-                
-                if rename_map:
-                    df = df.rename(columns=rename_map)
-                
-                # 如果沒有 Volume，設為0
-                if 'Volume' not in df.columns:
-                    df['Volume'] = 0
-                    st.sidebar.warning("⚠️ 數據無成交量欄位，已設為0")
-                
-                # 檢查數據間隔
-                if len(df) > 1:
-                    time_diff = (df.index[1] - df.index[0]).total_seconds() / 60
-                    st.sidebar.caption(f"⏱️ 數據間隔: {time_diff:.0f} 分鐘")
-                    
-                    # 特別處理：日K + 指定時段，需要先過濾再彙總
-                    if download_minute_for_daily and time_diff < 1440:
-                        st.sidebar.caption(f"⚙️ 過濾{session}時段並彙總為日K...")
-                        
-                        # 過濾時段
-                        hours = df.index.hour
-                        minutes = df.index.minute
-                        
-                        if session == "日盤":
-                            # 日盤：08:45 - 13:45（包含13:45收盤）
-                            mask = ((hours == 8) & (minutes >= 45)) | \
-                                   ((hours >= 9) & (hours < 13)) | \
-                                   ((hours == 13) & (minutes <= 45))
-                        else:  # 夜盤
-                            # 夜盤：15:00 - 05:00
-                            mask = (hours >= 15) | (hours < 5)
-                        
-                        df = df[mask]
-                        
-                        if df.empty:
-                            st.sidebar.warning(f"⚠️ {session}時段無數據")
-                            return None
-                        
-                        st.sidebar.caption(f"✅ 過濾後: {len(df)} 筆{session}分鐘K")
-                        
-                        # 顯示過濾後的日期範圍（調試用）
-                        if len(df) > 0:
-                            first_date = df.index[0].date()
-                            last_date = df.index[-1].date()
-                            first_time = df.index[0].strftime('%H:%M')
-                            last_time = df.index[-1].strftime('%H:%M')
-                            st.sidebar.caption(f"📅 日期範圍: {first_date} ~ {last_date}")
-                            st.sidebar.caption(f"⏰ 時間範圍: {first_time} ~ {last_time}")
-                        
-                        # 彙總為日K
+        # ==================== MA趨勢觸及吞噬策略計算 ====================
                         df['Date'] = df.index.date
                         df_grouped = df.groupby('Date').agg({
                             'Open': 'first',
@@ -2208,9 +1926,9 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
      1. 趨勢判斷：MA20 與 MA60 同方向，且 MA20 與 MA60 呈現多空排列
          - 多頭：MA20_slope > 0、MA60_slope > 0 且 MA20 > MA60
          - 空頭：MA20_slope < 0、MA60_slope < 0 且 MA20 < MA60
-     2. 進場：第 N 根 K 棒站上/站下 MA20，且第 N+1 根收盤吞噬前一根
-         - 做多：趨勢向上 + N 根收盤站上 MA20 + N+1 收盤 > 前一根 max(Open, Close) 且 收盤 > 兩條 MA
-         - 做空：趨勢向下 + N 根收盤站下 MA20 + N+1 收盤 < 前一根 min(Open, Close) 且 收盤 < 兩條 MA
+     2. 進場：第 N 根 K 棒觸及 MA20，且第 N+1 根收盤吞噬前一根
+         - 做多：趨勢向上 + N 根觸及 MA20 + N+1 收盤 > 前一根 max(Open, Close) 且 收盤 > 兩條 MA
+         - 做空：趨勢向下 + N 根觸及 MA20 + N+1 收盤 < 前一根 min(Open, Close) 且 收盤 < 兩條 MA
      3. 停損 / 退場：
          - 多頭：若當前 K 棒 Low < min(前一根 Open, 前一根 Close) 視為停損出場
          - 空頭：若當前 K 棒 High > max(前一根 Open, 前一根 Close) 視為停損出場
@@ -2304,8 +2022,7 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
             and row_curr["MA20"] < row_curr["MA60"]
         )
 
-        prev_stand_above_ma20 = row_prev["Close"] > row_prev["MA20"]
-        prev_stand_below_ma20 = row_prev["Close"] < row_prev["MA20"]
+        touch_ma20 = bool(row_prev["touch_ma20"])
 
         # 吞噬定義：
         # 多頭：收盤 > 前一根 max(Open, Close)
@@ -2315,6 +2032,11 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
         engulf_up = row_curr["Close"] > prev_high_ref
         engulf_down = row_curr["Close"] < prev_low_ref
 
+        # 進場限制：只適用當日訊號，跨日不計
+        prev_date = df.index[i - 1].date()
+        curr_date = df.index[i].date()
+        same_day_signal = prev_date == curr_date
+
         # 收盤前 30 分鐘內：不再開新倉
         cutoff_reached = minutes_left <= 30
 
@@ -2322,11 +2044,11 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
             # 做多進場：多頭排列 + 前一根碰 MA + 吞噬且收盤站上兩條 MA
             if (
                 uptrend
-                and prev_stand_above_ma20
+                and touch_ma20
                 and engulf_up
                 and row_curr["Close"] > row_curr["MA20"]
                 and row_curr["Close"] > row_curr["MA60"]
-            ) and (not cutoff_reached):
+            ) and (not cutoff_reached) and same_day_signal:
                 position = "LONG"
                 entry_idx = i
                 entry_price = row_curr["Close"]
@@ -2335,11 +2057,11 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
             # 做空進場：空頭排列 + 前一根碰 MA + 吞噬且收盤跌破兩條 MA
             elif (
                 downtrend
-                and prev_stand_below_ma20
+                and touch_ma20
                 and engulf_down
                 and row_curr["Close"] < row_curr["MA20"]
                 and row_curr["Close"] < row_curr["MA60"]
-            ) and (not cutoff_reached):
+            ) and (not cutoff_reached) and same_day_signal:
                 position = "SHORT"
                 entry_idx = i
                 entry_price = row_curr["Close"]

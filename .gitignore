@@ -51,6 +51,9 @@ test_*.py
 *.xlsx
 *.json
 
+# Backtest outputs
+backtest_outputs/
+
 # Database files
 *.db
 *.db-journal
