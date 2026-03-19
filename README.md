@@ -59,11 +59,12 @@
 ### 📐 技術指標
 - **20日均線 (MA20)**：橘色線，中期趨勢指標
 - **60日均線 (MA60)**：紫色線，長期趨勢指標
+- **100日均線 (MA100)**：青色線，長週期關鍵位觀察
 - **成交量柱狀圖**：紅綠配色符合台灣習慣（紅漲綠跌）
 
 ### 🎨 互動式圖表
 - **Plotly 圖表**：支援拖曳、縮放、懸停查看數據
-- **MA 均線**：20 日（橘）、60 日（紫）
+- **MA 均線**：20 日（橘）、60 日（紫）、100 日（青）
 - **成交量**：獨立子圖顯示
 - **顏色配置**：紅漲綠跌（符合台灣習慣）
 
@@ -157,7 +158,10 @@ streamlit run stock_city/app/streamlit_run_app.py
 - 若要取得更長歷史資料，請先回填 DB。
 
 ### 策略回測（K 線圖下方勾選）
-- **策略選擇**：20/60MA 趨勢 + 觸及 + 吞噬（進場/退場）
+- **策略選擇**：
+  - 策略1：20/60MA 趨勢 + 觸及 + 吞噬
+  - 策略2：MA60/MA100 關鍵K吞噬
+- **策略1（MA20/MA60 趨勢觸及吞噬）**：
 - **趨勢判斷**：
   - 多頭：MA20 斜率 > 0、MA60 斜率 > 0，且 MA20 > MA60
   - 空頭：MA20 斜率 < 0、MA60 斜率 < 0，且 MA20 < MA60
@@ -170,6 +174,12 @@ streamlit run stock_city/app/streamlit_run_app.py
   - 反向吞噬：未觸發停損前，若出現反向吞噬則視為反向出場
   - 最後一根：回測區間最後一根 K 棒強制出場
 - **跨日限制**：訊號只適用當日，若跨日才形成進場條件則不計入
+- **策略2（MA60/MA100 關鍵K吞噬）**：
+  - 關鍵K：第 N 根觸及 MA60 或 MA100（Low <= MA <= High）
+  - 多方進場：第 N+1 根 `max(Open, Close) > 關鍵K Close`
+  - 空方進場：第 N+1 根 `min(Open, Close) < 關鍵K Close`
+  - 方向過濾：多方需 MA60 斜率向上且收盤在 MA60 上方；空方反向
+  - 出場：反向吞噬或收盤反穿 MA60
 - **收盤前 30 分鐘風控**：
   - 日盤：13:45 收盤（結算日 13:30），距離收盤 30 分鐘內不再開新倉，且若仍有持倉會在第一根觸及的 K 棒強制平倉
   - 夜盤：次日 05:00 收盤，同樣在距離收盤 30 分鐘內停止開倉並強制平倉
@@ -183,8 +193,12 @@ streamlit run stock_city/app/streamlit_run_app.py
 使用 `backtest_strategy.py` 直接回測並輸出成交截圖與報表：
 
 ```bash
-python backtest_strategy.py --interval 5m --session 日盤 --days 365
+python backtest_strategy.py --strategy strategy2 --interval 5m --session 日盤 --days 365
 ```
+
+可用策略參數：
+- `--strategy strategy1`（或 `--strategy 1`）
+- `--strategy strategy2`（或 `--strategy 2`）
 
 輸出內容：
 - `trades.csv`：交易明細 + 最後一列 summary（總勝率、總損益）
