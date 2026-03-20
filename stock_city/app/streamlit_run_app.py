@@ -3,7 +3,7 @@
 =====================================================
 本程式提供台指期貨、台積電和台灣加權指數的 K 線圖表分析工具
 支援多時段切換（日盤/夜盤/全盤）、多週期 K 線（1分-日線）
-並包含移動平均線（MA20/MA60）技術指標
+並包含移動平均線（MA20/MA60/MA100）技術指標
 
 作者: AI Assistant
 版本: 3.0 - 使用 Shioaji API
@@ -37,6 +37,8 @@ from stock_city.db.tick_database import (
 from stock_city.project_paths import get_db_path
 from stock_city.strategy.ma20_ma60 import calculate_ma_trend_engulfing_signals
 import sqlite3
+
+LOGIN_GAP_CHECK_DAYS = 30
 
 # ============================================================
 # 1. 頁面初始化設定與 Shioaji 連線
@@ -336,6 +338,8 @@ with st.sidebar:
                                     st.info("✓ 已啟用多合約拼接功能，可獲取完整歷史數據")
                                     st.session_state['shioaji_logged_in'] = True
                                     st.session_state['shioaji_api'] = new_api
+                                    st.session_state['pending_login_gap_check'] = True
+                                    st.session_state['login_gap_check_days'] = LOGIN_GAP_CHECK_DAYS
                                     st.rerun()
                                 else:
                                     error_str = str(error) if error else '未知錯誤'
@@ -429,6 +433,8 @@ with st.sidebar:
                                     st.info("� 已啟用多合約拼接功能，可獲取完整歷史數據")
                                     st.session_state['shioaji_logged_in'] = True
                                     st.session_state['shioaji_api'] = new_api
+                                    st.session_state['pending_login_gap_check'] = True
+                                    st.session_state['login_gap_check_days'] = LOGIN_GAP_CHECK_DAYS
                                     st.rerun()
                                 else:
                                     st.error(f"❌ 登入失敗: {error if error else '未知錯誤'}")
@@ -563,17 +569,30 @@ with st.sidebar:
         if enable_strategy:
             strategy_type = st.selectbox(
                 "選擇策略類型",
-                ("MA交叉吞噬策略",),  # 未來可擴展更多策略
-                help="MA交叉吞噬策略：檢測MA20/MA60都向上趨勢時，在碰MA且下一根吞噬時進場"
+                (
+                    "策略1：MA20/MA60 趨勢觸及吞噬",
+                    "策略2：MA60/MA100 關鍵K吞噬",
+                ),
+                help="策略1：MA20/MA60 趨勢 + 觸及MA20 + 吞噬；策略2：關鍵K觸及 MA60 或 MA100 後，下一根依 close 規則吞噬進場"
             )
             st.session_state["strategy_type"] = strategy_type
-            st.info(
-                "📌 **策略規則**\n\n"
-                "• **進場**：MA20+MA60都向上 → 前一根觸及MA20 → 下一根吞噬 → 進場\n"
-                "• **加碼**：最新K棒吞噬前一根\n"
-                "• **做空**：反向邏輯（趨勢向下 → 碰MA → 反向吞噬）\n"
-                "• **退場**：相反信號出現時清倉"
-            )
+            if strategy_type == "策略2：MA60/MA100 關鍵K吞噬":
+                st.info(
+                    "📌 **策略2規則（MA60/MA100 關鍵K吞噬）**\n\n"
+                    "• **關鍵K**：第N根觸及 MA60 或 MA100（Low <= MA <= High）\n"
+                    "• **多方進場**：第N+1根 max(Open, Close) > 關鍵K Close\n"
+                    "• **空方進場**：第N+1根 min(Open, Close) < 關鍵K Close\n"
+                    "• **方向過濾**：多方需 MA60 斜率向上；空方需 MA60 斜率向下\n"
+                    "• **限制**：跨日不計，收盤前30分鐘不開新倉"
+                )
+            else:
+                st.info(
+                    "📌 **策略1規則（MA20/MA60 趨勢觸及吞噬）**\n\n"
+                    "• **進場**：MA20+MA60同向趨勢 → 前一根觸及MA20 → 下一根吞噬 → 進場\n"
+                    "• **做空**：反向邏輯（趨勢向下 → 觸及MA20 → 反向吞噬）\n"
+                    "• **退場**：反向吞噬或停損條件觸發\n"
+                    "• **限制**：跨日不計，收盤前30分鐘不開新倉"
+                )
 
     # 顯示提示訊息
     st.caption("💡 提示：啟用自動刷新可獲得動態K棒更新效果。")
@@ -853,6 +872,56 @@ with st.sidebar:
                 pass
         else:
             st.sidebar.info("ℹ️ 本次未回填到任何交易日，可能 API 範圍內無有效數據")
+
+    # 每次登入後，自動檢查並修補最近一段時間的遺漏資料
+    if logged_in and st.session_state.get('pending_login_gap_check', False):
+        api_instance = st.session_state.get('shioaji_api')
+        days_back = int(st.session_state.get('login_gap_check_days', LOGIN_GAP_CHECK_DAYS) or LOGIN_GAP_CHECK_DAYS)
+        days_back = max(10, min(days_back, 120))
+
+        st.sidebar.info(f"🔍 登入後自動檢查最近 {days_back} 個交易日資料缺漏...")
+
+        if api_instance is None:
+            st.sidebar.warning("⚠️ 尚未取得 Shioaji 連線，略過登入後缺漏檢查")
+            st.session_state['pending_login_gap_check'] = False
+        else:
+            try:
+                # 清除快取，確保檢查結果是最新 DB 狀態
+                try:
+                    get_recent_dayk_gaps.clear()
+                    get_db_dayk_inventory.clear()
+                except Exception:
+                    pass
+
+                total_gaps = 0
+                checked_sessions = []
+                for sess in ("日盤", "夜盤", "全盤"):
+                    gaps = get_recent_dayk_gaps(sess, days_back=days_back)
+                    gap_count = len(gaps)
+                    checked_sessions.append(f"{sess}:{gap_count}")
+                    total_gaps += gap_count
+                    if gap_count > 0:
+                        manual_backfill_recent_dayk(api_instance, sess, days_back=days_back)
+
+                try:
+                    get_recent_dayk_gaps.clear()
+                    get_db_dayk_inventory.clear()
+                except Exception:
+                    pass
+
+                if total_gaps > 0:
+                    st.sidebar.success(
+                        f"✅ 登入後缺漏檢查完成：{', '.join(checked_sessions)}，已啟動自動回填"
+                    )
+                else:
+                    st.sidebar.success(
+                        f"✅ 登入後缺漏檢查完成：{', '.join(checked_sessions)}，資料完整"
+                    )
+            except Exception as e:
+                st.sidebar.warning(f"⚠️ 登入後缺漏檢查失敗: {str(e)[:120]}")
+            finally:
+                st.session_state['pending_login_gap_check'] = False
+                st.session_state['last_login_gap_check_at'] = datetime.now(pytz.timezone('Asia/Taipei')).strftime("%Y-%m-%d %H:%M:%S")
     
     # 顯示當前設定摘要
     st.info(f"📊 **當前設定**\n- 商品: {product_option}\n- 時段: {session_option}\n- 週期: {interval_option}\n- K棒數: {max_kbars}\n- 自動刷新: {'✅ 啟用' if auto_refresh else '❌ 停用'}")
@@ -1159,6 +1228,9 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
         
         # 初始化 database
         init_database()
+
+        # 讀取快取（失敗時作為備援）
+        cached_df, _ = load_cache(product, interval, session)
 
         # ------------------------------------------------------------
         # 每日自動更新機制（若今日資料不存在或過舊）
@@ -1661,7 +1733,26 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
             # 回填後重新讀一次 DB，讓滑桿「真的連動」到更多日K
             df = get_kbars_from_db(interval=interval, session=session, days=days)
 
-        # ==================== MA趨勢觸及吞噬策略計算 ====================
+        if df is None or df.empty:
+            st.warning("⚠️ Shioaji 未返回數據")
+            if cached_df is not None and not cached_df.empty:
+                st.sidebar.warning("⚠️ API 失敗，使用快取數據")
+                return cached_df
+            return None
+
+        try:
+            # ------------------------------------------------------------
+            # 資料週期校正：若 DB 回傳的實際粒度與使用者選擇不同，嘗試重採樣
+            # ------------------------------------------------------------
+            time_diff = None
+            if len(df.index) >= 2:
+                diffs = df.index.to_series().diff().dropna()
+                if not diffs.empty:
+                    time_diff = float(diffs.dt.total_seconds().median() / 60.0)
+
+            if time_diff is not None:
+                if interval == "1d" and time_diff < 1440:
+                    if session != "全盤":
                         df['Date'] = df.index.date
                         df_grouped = df.groupby('Date').agg({
                             'Open': 'first',
@@ -1670,28 +1761,25 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                             'Close': 'last',
                             'Volume': 'sum'
                         })
-                        
+
                         # 顯示每日的開高低收（調試用）
                         if len(df_grouped) > 0:
                             st.sidebar.caption("📊 最近3日數據：")
                             for date_val in df_grouped.index[-3:]:
                                 row = df_grouped.loc[date_val]
-                                st.sidebar.caption(f"{date_val}: 開{row['Open']:.0f} 高{row['High']:.0f} 低{row['Low']:.0f} 收{row['Close']:.0f}")
-                        
+                                st.sidebar.caption(
+                                    f"{date_val}: 開{row['Open']:.0f} 高{row['High']:.0f} 低{row['Low']:.0f} 收{row['Close']:.0f}"
+                                )
+
                         df = df_grouped
-                        
-                        # 將日期索引轉換回 DatetimeIndex
                         df.index = pd.to_datetime(df.index)
-                        # 檢查是否已有時區
                         if df.index.tz is None:
                             df.index = df.index.tz_localize('Asia/Taipei')
                         else:
                             df.index = df.index.tz_convert('Asia/Taipei')
-                        
+
                         st.sidebar.caption(f"✅ 彙總後: {len(df)} 筆{session}日K")
-                    
-                    elif interval == "1d" and time_diff < 1440:
-                        # 全盤模式的日K（不過濾時段）
+                    else:
                         st.sidebar.warning(f"⚠️ API返回{time_diff:.0f}分K，正在轉換為日K...")
                         df = df.resample('1D').agg({
                             'Open': 'first',
@@ -1701,94 +1789,88 @@ def get_data_from_shioaji(_api, interval, product, session, max_kbars):
                             'Volume': 'sum'
                         }).dropna()
                         st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆日K")
-                    elif interval == "60m" and time_diff < 60:
-                        df = df.resample('60min').agg({
-                            'Open': 'first',
-                            'High': 'max',
-                            'Low': 'min',
-                            'Close': 'last',
-                            'Volume': 'sum'
-                        }).dropna()
-                        st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆60分K")
-                    elif interval == "30m" and time_diff < 30:
-                        df = df.resample('30min').agg({
-                            'Open': 'first',
-                            'High': 'max',
-                            'Low': 'min',
-                            'Close': 'last',
-                            'Volume': 'sum'
-                        }).dropna()
-                        st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆30分K")
-                    elif interval == "15m" and time_diff < 15:
-                        df = df.resample('15min').agg({
-                            'Open': 'first',
-                            'High': 'max',
-                            'Low': 'min',
-                            'Close': 'last',
-                            'Volume': 'sum'
-                        }).dropna()
-                        st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆15分K")
-                    elif interval == "5m" and time_diff < 5:
-                        df = df.resample('5min').agg({
-                            'Open': 'first',
-                            'High': 'max',
-                            'Low': 'min',
-                            'Close': 'last',
-                            'Volume': 'sum'
-                        }).dropna()
-                        st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆5分K")
-                    elif interval == "1m" and time_diff > 1:
-                        # 如果API返回的不是1分K（例如5分K），但用戶要1分K
-                        st.sidebar.warning(f"⚠️ API返回{time_diff:.0f}分K，無法轉換為1分K（數據不足）")
-                
-                # 3. 獲取即時報價並更新最後一根K棒（非日K才需要）
-                if interval != "1d" and len(df) > 0:
-                    try:
-                        # 使用 snapshots 獲取最新報價
-                        snapshot = _api.snapshots([contract])
-                        if snapshot and len(snapshot) > 0:
-                            latest_price = snapshot[0].close
-                            if latest_price and latest_price > 0:
-                                # 更新最後一根K棒（模擬進行中的K棒）
-                                last_idx = df.index[-1]
-                                
-                                # 如果最新價格高於最高價，更新最高價
-                                if latest_price > df.loc[last_idx, 'High']:
-                                    df.loc[last_idx, 'High'] = latest_price
-                                
-                                # 如果最新價格低於最低價，更新最低價
-                                if latest_price < df.loc[last_idx, 'Low']:
-                                    df.loc[last_idx, 'Low'] = latest_price
-                                
-                                # 更新收盤價為最新價格
-                                df.loc[last_idx, 'Close'] = latest_price
-                                
-                                st.sidebar.caption(f"⚡ 即時價格: {latest_price:.0f} (已更新至最後一根K棒)")
-                    except Exception as snapshot_error:
-                        st.sidebar.caption(f"⚠️ 無法獲取即時報價: {str(snapshot_error)[:50]}")
-                
-                # 4. 合併快取數據和新數據
-                if cached_df is not None and not cached_df.empty:
-                    original_len = len(df)
-                    df = merge_data(cached_df, df)
-                    st.sidebar.caption(f"🔄 合併快取: {original_len} 筆新 + {len(cached_df)} 筆舊 = {len(df)} 筆")
-                
-                # 5. 儲存到快取
-                save_cache(df, product, interval, session)
-                
-                return df
-            except Exception as e:
-                st.error(f"❌ 資料轉換失敗: {e}")
-                # 如果處理失敗但有快取，返回快取數據
-                if cached_df is not None and not cached_df.empty:
-                    st.sidebar.warning("⚠️ 使用快取數據")
-                    return cached_df
-                return None
-        else:
-            st.warning("⚠️ Shioaji 未返回數據")
-            # 如果 API 失敗但有快取，返回快取數據
+                elif interval == "60m" and time_diff < 60:
+                    df = df.resample('60min').agg({
+                        'Open': 'first',
+                        'High': 'max',
+                        'Low': 'min',
+                        'Close': 'last',
+                        'Volume': 'sum'
+                    }).dropna()
+                    st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆60分K")
+                elif interval == "30m" and time_diff < 30:
+                    df = df.resample('30min').agg({
+                        'Open': 'first',
+                        'High': 'max',
+                        'Low': 'min',
+                        'Close': 'last',
+                        'Volume': 'sum'
+                    }).dropna()
+                    st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆30分K")
+                elif interval == "15m" and time_diff < 15:
+                    df = df.resample('15min').agg({
+                        'Open': 'first',
+                        'High': 'max',
+                        'Low': 'min',
+                        'Close': 'last',
+                        'Volume': 'sum'
+                    }).dropna()
+                    st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆15分K")
+                elif interval == "5m" and time_diff < 5:
+                    df = df.resample('5min').agg({
+                        'Open': 'first',
+                        'High': 'max',
+                        'Low': 'min',
+                        'Close': 'last',
+                        'Volume': 'sum'
+                    }).dropna()
+                    st.sidebar.caption(f"✅ 重採樣後: {len(df)} 筆5分K")
+                elif interval == "1m" and time_diff > 1:
+                    # 如果DB返回的不是1分K（例如5分K），但用戶要1分K
+                    st.sidebar.warning(f"⚠️ API返回{time_diff:.0f}分K，無法轉換為1分K（數據不足）")
+
+            # 3. 僅在開盤時獲取即時報價並更新最後一根K棒（避免收盤後覆蓋歷史K值）
+            market_status_text, market_is_open, market_session = get_market_status()
+            should_realtime_update = session == "全盤" or session == market_session
+
+            if (
+                interval != "1d"
+                and len(df) > 0
+                and _api is not None
+                and market_is_open
+                and should_realtime_update
+            ):
+                try:
+                    contract = _api.Contracts.Futures.TXF.TXFR1
+                    snapshot = _api.snapshots([contract])
+                    if snapshot and len(snapshot) > 0:
+                        latest_price = snapshot[0].close
+                        if latest_price and latest_price > 0:
+                            last_idx = df.index[-1]
+
+                            if latest_price > df.loc[last_idx, 'High']:
+                                df.loc[last_idx, 'High'] = latest_price
+                            if latest_price < df.loc[last_idx, 'Low']:
+                                df.loc[last_idx, 'Low'] = latest_price
+
+                            df.loc[last_idx, 'Close'] = latest_price
+                            st.sidebar.caption(f"⚡ 即時價格: {latest_price:.0f} (已更新至最後一根K棒)")
+                except Exception as snapshot_error:
+                    st.sidebar.caption(f"⚠️ 無法獲取即時報價: {str(snapshot_error)[:50]}")
+
+            # 4. 合併快取數據和新數據
             if cached_df is not None and not cached_df.empty:
-                st.sidebar.warning("⚠️ API 失敗，使用快取數據")
+                original_len = len(df)
+                df = merge_data(cached_df, df)
+                st.sidebar.caption(f"🔄 合併快取: {original_len} 筆新 + {len(cached_df)} 筆舊 = {len(df)} 筆")
+
+            # 5. 儲存到快取
+            save_cache(df, product, interval, session)
+            return df
+        except Exception as e:
+            st.error(f"❌ 資料轉換失敗: {e}")
+            if cached_df is not None and not cached_df.empty:
+                st.sidebar.warning("⚠️ 使用快取數據")
                 return cached_df
             return None
             
@@ -1842,6 +1924,7 @@ def process_kline_data(df, interval, session):
     df = df.copy()  # 避免 SettingWithCopyWarning
     df.loc[:, 'MA20'] = df['Close'].rolling(window=20).mean()
     df.loc[:, 'MA60'] = df['Close'].rolling(window=60).mean()
+    df.loc[:, 'MA100'] = df['Close'].rolling(window=100).mean()
     
     return df
 
@@ -1914,6 +1997,7 @@ def apply_realtime_snapshot_to_kbars(df: pd.DataFrame, interval: str, latest_pri
     if "Close" in df.columns:
         df.loc[:, "MA20"] = df["Close"].rolling(window=20).mean()
         df.loc[:, "MA60"] = df["Close"].rolling(window=60).mean()
+        df.loc[:, "MA100"] = df["Close"].rolling(window=100).mean()
 
     return df
 
@@ -2202,6 +2286,209 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
 
     return trades, add_events
 
+
+def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_realtime=False):
+    """
+    策略2：MA60/MA100 關鍵K 吞噬策略
+
+    規則：
+    1. 關鍵K（第N根）觸及判斷採 buffer：Low-10 <= MA <= High+10
+    2. 多方進場（第N+1根）：max(Open, Close) > 關鍵K Close，且 MA60 斜率向上、收盤在 MA60 上方
+    3. 空方進場（第N+1根）：min(Open, Close) < 關鍵K Close，且 MA60 斜率向下、收盤在 MA60 下方
+    4. 關鍵K close 位置：多方需 close > 觸碰到的 MA；空方需 close < 觸碰到的 MA
+    5. 限制：跨日訊號不計；收盤前30分鐘不開新倉
+    6. 退場：依 N/N+1 實體高低規則；非即時模式最後一根強制平倉
+    """
+    if df is None or len(df) < min_bars:
+        return [], []
+
+    df = df.copy()
+    trades = []
+    add_events = []
+
+    if "MA60" not in df.columns:
+        df["MA60"] = df["Close"].rolling(window=60).mean()
+    if "MA100" not in df.columns:
+        df["MA100"] = df["Close"].rolling(window=100).mean()
+    df["MA60_slope"] = df["MA60"].diff()
+
+    position = None
+    buffer_points = 10.0
+
+    entry_idx = None
+    entry_price = None
+    bars_in_position = 0
+
+    def minutes_to_session_close(ts):
+        if not hasattr(ts, "tzinfo") or ts.tzinfo is None:
+            taipei_tz = pytz.timezone("Asia/Taipei")
+            ts = taipei_tz.localize(ts)
+        else:
+            ts = ts.astimezone(pytz.timezone("Asia/Taipei"))
+
+        day = ts.date()
+        taipei_tz = pytz.timezone("Asia/Taipei")
+
+        if session == "日盤":
+            close_dt = taipei_tz.localize(datetime(day.year, day.month, day.day, 13, 45))
+        elif session == "夜盤":
+            next_day = day + timedelta(days=1)
+            close_dt = taipei_tz.localize(datetime(next_day.year, next_day.month, next_day.day, 5, 0))
+        else:
+            if ts.hour < 12:
+                close_dt = taipei_tz.localize(datetime(day.year, day.month, day.day, 13, 45))
+            else:
+                next_day = day + timedelta(days=1)
+                close_dt = taipei_tz.localize(datetime(next_day.year, next_day.month, next_day.day, 5, 0))
+
+        delta = close_dt - ts
+        return delta.total_seconds() / 60.0
+
+    for i in range(1, len(df)):
+        row_prev = df.iloc[i - 1]
+        row_curr = df.iloc[i]
+
+        if pd.isna(row_prev.get("MA60")) or pd.isna(row_curr.get("MA60")) or pd.isna(row_prev.get("MA100")):
+            continue
+
+        buffered_low = float(row_prev["Low"]) - buffer_points
+        buffered_high = float(row_prev["High"]) + buffer_points
+
+        key_touch_ma60 = bool(buffered_low <= row_prev["MA60"] <= buffered_high)
+        key_touch_ma100 = bool(buffered_low <= row_prev["MA100"] <= buffered_high)
+
+        # 新增條件：關鍵K open/close 相對於「觸碰到的 MA」位置
+        key_close_long_valid = (
+            (key_touch_ma60 and row_prev["Close"] > row_prev["MA60"] and row_prev["Open"] > row_prev["MA60"])
+            or (key_touch_ma100 and row_prev["Close"] > row_prev["MA100"] and row_prev["Open"] > row_prev["MA100"])
+        )
+        key_close_short_valid = (
+            (key_touch_ma60 and row_prev["Close"] < row_prev["MA60"] and row_prev["Open"] < row_prev["MA60"])
+            or (key_touch_ma100 and row_prev["Close"] < row_prev["MA100"] and row_prev["Open"] < row_prev["MA100"])
+        )
+        ma60_up = (row_curr["MA60_slope"] > 0) and (row_curr["Close"] > row_curr["MA60"])
+        ma60_down = (row_curr["MA60_slope"] < 0) and (row_curr["Close"] < row_curr["MA60"])
+
+        engulf_up = max(row_curr["Open"], row_curr["Close"]) > row_prev["Close"]
+        engulf_down = min(row_curr["Open"], row_curr["Close"]) < row_prev["Close"]
+
+        prev_date = df.index[i - 1].date()
+        curr_date = df.index[i].date()
+        same_day_signal = prev_date == curr_date
+
+        minutes_left = minutes_to_session_close(df.index[i])
+        cutoff_reached = minutes_left <= 30
+
+        if position is None:
+            if key_close_long_valid and ma60_up and engulf_up and same_day_signal and (not cutoff_reached):
+                position = "LONG"
+                entry_idx = i
+                entry_price = row_curr["Close"]
+                bars_in_position = 1
+            elif key_close_short_valid and ma60_down and engulf_down and same_day_signal and (not cutoff_reached):
+                position = "SHORT"
+                entry_idx = i
+                entry_price = row_curr["Close"]
+                bars_in_position = 1
+            continue
+
+        bars_in_position += 1
+
+        if cutoff_reached:
+            exit_idx = i
+            exit_price = row_curr["Close"]
+            trades.append({
+                "entry_idx": entry_idx,
+                "entry_ts": df.index[entry_idx],
+                "entry_price": entry_price,
+                "exit_idx": exit_idx,
+                "exit_ts": df.index[exit_idx],
+                "exit_price": exit_price,
+                "direction": position,
+                "bars_held": bars_in_position,
+                "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+                "exit_reason": "收盤前30分鐘強制平倉",
+            })
+            position = None
+            entry_idx = None
+            entry_price = None
+            bars_in_position = 0
+            continue
+
+        prev_body_low = min(row_prev["Open"], row_prev["Close"])
+        prev_body_high = max(row_prev["Open"], row_prev["Close"])
+
+        # 依使用者規則：
+        # 多方出場：當 N+1 收盤 < 第 N 根 min(Open, Close)
+        # 空方出場：當 N+1 收盤 > 第 N 根 max(Open, Close)
+        if position == "LONG" and row_curr["Close"] < prev_body_low:
+            exit_idx = i
+            exit_price = row_curr["Close"]
+            trades.append({
+                "entry_idx": entry_idx,
+                "entry_ts": df.index[entry_idx],
+                "entry_price": entry_price,
+                "exit_idx": exit_idx,
+                "exit_ts": df.index[exit_idx],
+                "exit_price": exit_price,
+                "direction": position,
+                "bars_held": bars_in_position,
+                "pnl": exit_price - entry_price,
+                "exit_reason": "多方出場(N+1收盤<前一根實體低點)",
+            })
+            position = None
+            entry_idx = None
+            entry_price = None
+            bars_in_position = 0
+            continue
+
+        if position == "SHORT" and row_curr["Close"] > prev_body_high:
+            exit_idx = i
+            exit_price = row_curr["Close"]
+            trades.append({
+                "entry_idx": entry_idx,
+                "entry_ts": df.index[entry_idx],
+                "entry_price": entry_price,
+                "exit_idx": exit_idx,
+                "exit_ts": df.index[exit_idx],
+                "exit_price": exit_price,
+                "direction": position,
+                "bars_held": bars_in_position,
+                "pnl": entry_price - exit_price,
+                "exit_reason": "空方出場(N+1收盤>前一根實體高點)",
+            })
+            position = None
+            entry_idx = None
+            entry_price = None
+            bars_in_position = 0
+            continue
+
+    if (not is_realtime) and position is not None and entry_idx is not None:
+        exit_idx = len(df) - 1
+        exit_price = df.iloc[exit_idx]["Close"]
+        trades.append({
+            "entry_idx": entry_idx,
+            "entry_ts": df.index[entry_idx],
+            "entry_price": entry_price,
+            "exit_idx": exit_idx,
+            "exit_ts": df.index[exit_idx],
+            "exit_price": exit_price,
+            "direction": position,
+            "bars_held": bars_in_position,
+            "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+            "exit_reason": "最後一根收盤",
+        })
+
+    return trades, add_events
+
+
+def run_selected_strategy(df, session="日盤", is_realtime=False):
+    """依使用者選擇執行策略。"""
+    strategy_type = st.session_state.get("strategy_type", "策略1：MA20/MA60 趨勢觸及吞噬")
+    if strategy_type == "策略2：MA60/MA100 關鍵K吞噬":
+        return calculate_ma60_key_engulfing_signals(df, session=session, is_realtime=is_realtime)
+    return calculate_ma_trend_engulfing_signals(df, session=session, is_realtime=is_realtime)
+
 # 主要數據獲取函數
 def get_data(interval, product, session, max_kbars, use_shioaji=False, api_instance=None):
     """
@@ -2366,8 +2653,8 @@ else:
 if df is not None:
     original_count = len(df)
     
-    # 計算所需的最大窗口（MA60 需要 60 筆）
-    ma_window = 60
+    # 計算所需的最大窗口（MA100 需要 100 筆）
+    ma_window = 100
     
     # 如果數據量大於需要顯示的數量，先保留足夠計算 MA 的數據
     if original_count > max_kbars:
@@ -2387,6 +2674,7 @@ if df is not None:
         df_for_calc = df_for_calc.copy()
         df_for_calc['MA20'] = df_for_calc['Close'].rolling(window=20).mean()
         df_for_calc['MA60'] = df_for_calc['Close'].rolling(window=60).mean()
+        df_for_calc['MA100'] = df_for_calc['Close'].rolling(window=100).mean()
         
         # 最後只取需要顯示的部分
         df = df_for_calc.tail(max_kbars)
@@ -2513,11 +2801,25 @@ if df is not None:
         row=1, col=1
     )
 
+    # 繪製 100 日移動平均線（青色）
+    fig.add_trace(
+        go.Scatter(
+            x=x_range,  # 使用連續數字索引
+            y=df['MA100'],
+            line=dict(color='cyan', width=1.5),
+            name='100 MA',
+            text=date_labels,
+            hovertext=date_labels,
+            hovertemplate='<b>%{text}</b><br>MA100: %{y:.0f}<extra></extra>'
+        ),
+        row=1, col=1
+    )
+
     # ============================================================
     # 5.3.1 繪製策略信號標記
     # ============================================================
     if st.session_state.get("enable_strategy", False):
-        trades, add_events = calculate_ma_trend_engulfing_signals(df, session=session_option, is_realtime=is_realtime)
+        trades, add_events = run_selected_strategy(df, session=session_option, is_realtime=is_realtime)
         
         if trades:
             # 進場信號點
@@ -2684,16 +2986,16 @@ if df is not None:
     # 5.6.0 策略選擇（K 線圖下方）
     # ------------------------------------------------------------
     st.checkbox(
-        "策略選擇：20/60MA 趨勢 + 觸及 + 吞噬（進場/補單）",
+        "啟用策略信號（可於上方選擇策略1/策略2）",
         value=st.session_state.get("enable_strategy", False),
         key="enable_strategy",
-        help="趨勢同向時，K棒觸及 MA 且下一根吞噬即進場；持倉期間同向吞噬補單，反向吞噬退場"
+        help="策略1：MA20/MA60 趨勢觸及吞噬；策略2：MA60/MA100 關鍵K吞噬"
     )
     # ============================================================
     # 5.6.1 顯示策略交易紀錄
     # ============================================================
     if st.session_state.get("enable_strategy", False):
-        trades, _ = calculate_ma_trend_engulfing_signals(df, session=session_option, is_realtime=is_realtime)
+        trades, _ = run_selected_strategy(df, session=session_option, is_realtime=is_realtime)
         
         if trades:
             with st.expander("📋 交易紀錄", expanded=True):

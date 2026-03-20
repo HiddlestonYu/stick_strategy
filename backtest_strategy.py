@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from stock_city.db.tick_database import get_kbars_from_db
-from stock_city.strategy.ma20_ma60 import calculate_ma_trend_engulfing_signals
+from stock_city.strategy.ma20_ma60 import run_selected_strategy
 
 
 def _ensure_ma_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -173,13 +173,13 @@ def _plot_trade_window(
     return fig
 
 
-def run_backtest(interval: str, session: str, days: int, out_dir: str, bars_before: int, bars_after: int):
+def run_backtest(interval: str, session: str, days: int, out_dir: str, bars_before: int, bars_after: int, strategy: str):
     df = get_kbars_from_db(interval=interval, session=session, days=days)
     if df is None or df.empty:
         raise ValueError("找不到可回測的K線資料")
 
     df = _ensure_ma_columns(df)
-    trades, _ = calculate_ma_trend_engulfing_signals(df, session=session, is_realtime=False)
+    trades, _ = run_selected_strategy(df, strategy=strategy, session=session, is_realtime=False)
 
     trade_df = _build_trade_table(df, trades)
     os.makedirs(out_dir, exist_ok=True)
@@ -238,6 +238,7 @@ def main():
     parser.add_argument("--interval", default="5m", help="K 線週期，例如 1m/5m/15m/30m/60m/1d")
     parser.add_argument("--session", default="日盤", help="時段：日盤/夜盤/全盤")
     parser.add_argument("--days", type=int, default=365, help="回測天數")
+    parser.add_argument("--strategy", default="strategy1", choices=["strategy1", "strategy2", "1", "2"], help="策略選擇：strategy1 或 strategy2")
     parser.add_argument("--out", default="backtest_outputs", help="輸出資料夾")
     parser.add_argument("--bars-before", type=int, default=20, help="進場前要截取的 K 棒數")
     parser.add_argument("--bars-after", type=int, default=20, help="進場後要截取的 K 棒數")
@@ -246,7 +247,8 @@ def main():
 
     taipei_tz = pytz.timezone("Asia/Taipei")
     now_str = datetime.now(taipei_tz).strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(args.out, f"{args.session}_{args.interval}_{now_str}")
+    strategy_key = "strategy2" if str(args.strategy).strip().lower() in ("2", "strategy2") else "strategy1"
+    out_dir = os.path.join(args.out, f"{strategy_key}_{args.session}_{args.interval}_{now_str}")
 
     trade_df, trade_csv, image_dir, total_trades, win_rate, total_pnl = run_backtest(
         interval=args.interval,
@@ -255,8 +257,10 @@ def main():
         out_dir=out_dir,
         bars_before=args.bars_before,
         bars_after=args.bars_after,
+        strategy=strategy_key,
     )
 
+    print(f"策略：{strategy_key}")
     print(f"回測完成：共 {total_trades} 筆交易")
     print(f"總勝率：{win_rate:.2f}%")
     print(f"總損益(點)：{total_pnl:.2f}")
