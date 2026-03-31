@@ -234,11 +234,11 @@ def run_backtest(interval: str, session: str, days: int, out_dir: str, bars_befo
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MA20/MA60 策略年度回測")
+    parser = argparse.ArgumentParser(description="新策略1（MA60/MA100 關鍵K吞噬）年度回測")
     parser.add_argument("--interval", default="5m", help="K 線週期，例如 1m/5m/15m/30m/60m/1d")
     parser.add_argument("--session", default="日盤", help="時段：日盤/夜盤/全盤")
     parser.add_argument("--days", type=int, default=365, help="回測天數")
-    parser.add_argument("--strategy", default="strategy1", choices=["strategy1", "strategy2", "1", "2"], help="策略選擇：strategy1 或 strategy2")
+    parser.add_argument("--strategy", default="strategy1", choices=["strategy1", "1"], help="策略選擇：strategy1")
     parser.add_argument("--out", default="backtest_outputs", help="輸出資料夾")
     parser.add_argument("--bars-before", type=int, default=20, help="進場前要截取的 K 棒數")
     parser.add_argument("--bars-after", type=int, default=20, help="進場後要截取的 K 棒數")
@@ -247,7 +247,7 @@ def main():
 
     taipei_tz = pytz.timezone("Asia/Taipei")
     now_str = datetime.now(taipei_tz).strftime("%Y%m%d_%H%M%S")
-    strategy_key = "strategy2" if str(args.strategy).strip().lower() in ("2", "strategy2") else "strategy1"
+    strategy_key = "strategy1"
     out_dir = os.path.join(args.out, f"{strategy_key}_{args.session}_{args.interval}_{now_str}")
 
     trade_df, trade_csv, image_dir, total_trades, win_rate, total_pnl = run_backtest(

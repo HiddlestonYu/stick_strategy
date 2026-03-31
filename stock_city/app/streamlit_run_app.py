@@ -567,32 +567,14 @@ with st.sidebar:
         st.session_state["enable_strategy"] = enable_strategy
         
         if enable_strategy:
-            strategy_type = st.selectbox(
-                "選擇策略類型",
-                (
-                    "策略1：MA20/MA60 趨勢觸及吞噬",
-                    "策略2：MA60/MA100 關鍵K吞噬",
-                ),
-                help="策略1：MA20/MA60 趨勢 + 觸及MA20 + 吞噬；策略2：關鍵K觸及 MA60 或 MA100 後，下一根依 close 規則吞噬進場"
+            st.info(
+                "📌 **新策略1規則（MA60/MA100 關鍵K吞噬）**\n\n"
+                "• **關鍵K**：第N根以 buffer 判斷觸及 MA60 或 MA100\n"
+                "• **多方吞噬**：第N+1根 Close > 第N根 max(Open, Close)\n"
+                "• **空方吞噬**：第N+1根 Close < 第N根 min(Open, Close)\n"
+                "• **方向過濾**：多方需 MA60 斜率向上；空方需 MA60 斜率向下\n"
+                "• **限制**：跨日不計，收盤前30分鐘不開新倉"
             )
-            st.session_state["strategy_type"] = strategy_type
-            if strategy_type == "策略2：MA60/MA100 關鍵K吞噬":
-                st.info(
-                    "📌 **策略2規則（MA60/MA100 關鍵K吞噬）**\n\n"
-                    "• **關鍵K**：第N根觸及 MA60 或 MA100（Low <= MA <= High）\n"
-                    "• **多方進場**：第N+1根 max(Open, Close) > 關鍵K Close\n"
-                    "• **空方進場**：第N+1根 min(Open, Close) < 關鍵K Close\n"
-                    "• **方向過濾**：多方需 MA60 斜率向上；空方需 MA60 斜率向下\n"
-                    "• **限制**：跨日不計，收盤前30分鐘不開新倉"
-                )
-            else:
-                st.info(
-                    "📌 **策略1規則（MA20/MA60 趨勢觸及吞噬）**\n\n"
-                    "• **進場**：MA20+MA60同向趨勢 → 前一根觸及MA20 → 下一根吞噬 → 進場\n"
-                    "• **做空**：反向邏輯（趨勢向下 → 觸及MA20 → 反向吞噬）\n"
-                    "• **退場**：反向吞噬或停損條件觸發\n"
-                    "• **限制**：跨日不計，收盤前30分鐘不開新倉"
-                )
 
     # 顯示提示訊息
     st.caption("💡 提示：啟用自動刷新可獲得動態K棒更新效果。")
@@ -2287,14 +2269,14 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
     return trades, add_events
 
 
-def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_realtime=False):
+def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=False):
     """
-    策略2：MA60/MA100 關鍵K 吞噬策略
+    新策略1：MA60/MA100 關鍵K 吞噬策略
 
     規則：
     1. 關鍵K（第N根）觸及判斷採 buffer：Low-10 <= MA <= High+10
-    2. 多方進場（第N+1根）：max(Open, Close) > 關鍵K Close，且 MA60 斜率向上、收盤在 MA60 上方
-    3. 空方進場（第N+1根）：min(Open, Close) < 關鍵K Close，且 MA60 斜率向下、收盤在 MA60 下方
+    2. 多方進場（第N+1根）：Close > 第N根 max(Open, Close)，且 MA60 斜率向上、收盤在 MA60 上方
+    3. 空方進場（第N+1根）：Close < 第N根 min(Open, Close)，且 MA60 斜率向下、收盤在 MA60 下方
     4. 關鍵K close 位置：多方需 close > 觸碰到的 MA；空方需 close < 觸碰到的 MA
     5. 限制：跨日訊號不計；收盤前30分鐘不開新倉
     6. 退場：依 N/N+1 實體高低規則；非即時模式最後一根強制平倉
@@ -2369,8 +2351,8 @@ def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_
         ma60_up = (row_curr["MA60_slope"] > 0) and (row_curr["Close"] > row_curr["MA60"])
         ma60_down = (row_curr["MA60_slope"] < 0) and (row_curr["Close"] < row_curr["MA60"])
 
-        engulf_up = max(row_curr["Open"], row_curr["Close"]) > row_prev["Close"]
-        engulf_down = min(row_curr["Open"], row_curr["Close"]) < row_prev["Close"]
+        engulf_up = row_curr["Close"] > max(row_prev["Open"], row_prev["Close"])
+        engulf_down = row_curr["Close"] < min(row_prev["Open"], row_prev["Close"])
 
         prev_date = df.index[i - 1].date()
         curr_date = df.index[i].date()
@@ -2380,12 +2362,24 @@ def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_
         cutoff_reached = minutes_left <= 30
 
         if position is None:
-            if key_close_long_valid and ma60_up and engulf_up and same_day_signal and (not cutoff_reached):
+            if (
+                key_close_long_valid
+                and ma60_up
+                and engulf_up
+                and same_day_signal
+                and (not cutoff_reached)
+            ):
                 position = "LONG"
                 entry_idx = i
                 entry_price = row_curr["Close"]
                 bars_in_position = 1
-            elif key_close_short_valid and ma60_down and engulf_down and same_day_signal and (not cutoff_reached):
+            elif (
+                key_close_short_valid
+                and ma60_down
+                and engulf_down
+                and same_day_signal
+                and (not cutoff_reached)
+            ):
                 position = "SHORT"
                 entry_idx = i
                 entry_price = row_curr["Close"]
@@ -2483,11 +2477,8 @@ def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_
 
 
 def run_selected_strategy(df, session="日盤", is_realtime=False):
-    """依使用者選擇執行策略。"""
-    strategy_type = st.session_state.get("strategy_type", "策略1：MA20/MA60 趨勢觸及吞噬")
-    if strategy_type == "策略2：MA60/MA100 關鍵K吞噬":
-        return calculate_ma60_key_engulfing_signals(df, session=session, is_realtime=is_realtime)
-    return calculate_ma_trend_engulfing_signals(df, session=session, is_realtime=is_realtime)
+    """統一執行新策略1。"""
+    return calculate_strategy1_signals(df, session=session, is_realtime=is_realtime)
 
 # 主要數據獲取函數
 def get_data(interval, product, session, max_kbars, use_shioaji=False, api_instance=None):
@@ -2822,9 +2813,15 @@ if df is not None:
         trades, add_events = run_selected_strategy(df, session=session_option, is_realtime=is_realtime)
         
         if trades:
+            marker_offset = 30.0
+
             # 進場信號點
             entry_indices = [t["entry_idx"] for t in trades]
-            entry_prices = [df.iloc[idx]["Close"] for idx in entry_indices]
+            entry_prices = [
+                (float(df.iloc[idx]["High"]) + marker_offset) if t["direction"] == "LONG"
+                else (float(df.iloc[idx]["Low"]) - marker_offset)
+                for idx, t in zip(entry_indices, trades)
+            ]
             entry_symbols = ["triangle-up" if t["direction"] == "LONG" else "triangle-down" for t in trades]
             entry_colors = ["green" if t["direction"] == "LONG" else "red" for t in trades]
             entry_labels = [f"進場 {t['direction']}" for t in trades]
@@ -2835,13 +2832,13 @@ if df is not None:
                     y=entry_prices,
                     mode='markers',
                     marker=dict(
-                        size=12,
+                        size=10,
                         symbol=entry_symbols,
                         color=entry_colors,
                         line=dict(color='white', width=2)
                     ),
                     name='進場信號',
-                    text=[f"進場: {p:.0f}<br>方向: {t['direction']}" for p, t in zip(entry_prices, trades)],
+                    text=[f"進場: {t['entry_price']:.0f}<br>方向: {t['direction']}" for t in trades],
                     hovertemplate='<b>%{text}</b><extra></extra>'
                 ),
                 row=1, col=1
@@ -2849,7 +2846,11 @@ if df is not None:
             
             # 退場信號點
             exit_indices = [t["exit_idx"] for t in trades]
-            exit_prices = [df.iloc[idx]["Close"] for idx in exit_indices]
+            exit_prices = [
+                (float(df.iloc[idx]["Low"]) - marker_offset) if t["direction"] == "LONG"
+                else (float(df.iloc[idx]["High"]) + marker_offset)
+                for idx, t in zip(exit_indices, trades)
+            ]
             exit_colors = ["darkgreen" if t["direction"] == "LONG" else "darkred" for t in trades]
             
             fig.add_trace(
@@ -2858,13 +2859,13 @@ if df is not None:
                     y=exit_prices,
                     mode='markers',
                     marker=dict(
-                        size=10,
+                        size=8,
                         symbol='circle',
                         color=exit_colors,
                         line=dict(color='yellow', width=2)
                     ),
                     name='退場信號',
-                    text=[f"退場: {p:.0f}<br>方向: {t['direction']}<br>損益: {t['pnl']:.0f}" for p, t in zip(exit_prices, trades)],
+                    text=[f"退場: {t['exit_price']:.0f}<br>方向: {t['direction']}<br>損益: {t['pnl']:.0f}" for t in trades],
                     hovertemplate='<b>%{text}</b><extra></extra>'
                 ),
                 row=1, col=1
@@ -2986,10 +2987,10 @@ if df is not None:
     # 5.6.0 策略選擇（K 線圖下方）
     # ------------------------------------------------------------
     st.checkbox(
-        "啟用策略信號（可於上方選擇策略1/策略2）",
+        "啟用策略信號（新策略1）",
         value=st.session_state.get("enable_strategy", False),
         key="enable_strategy",
-        help="策略1：MA20/MA60 趨勢觸及吞噬；策略2：MA60/MA100 關鍵K吞噬"
+        help="新策略1：MA60/MA100 關鍵K吞噬"
     )
     # ============================================================
     # 5.6.1 顯示策略交易紀錄

@@ -1,7 +1,7 @@
-# 策略規格文件（策略1 / 策略2）
+# 策略規格文件（新策略1）
 
 ## 目的
-本文件記錄目前可選策略規則，作為後續調整與回測依據。
+本文件記錄目前單一策略規則，作為後續調整與回測依據。
 
 ## 適用範圍
 - 資料來源：SQLite DB（由 Shioaji 更新）
@@ -22,62 +22,15 @@
 - 即時模式不做「最後一根強制平倉」。
 - 回測模式會在最後一根收盤強制平倉（僅用於回測統計）。
 
----
-
-# 策略1：MA20/MA60 趨勢觸及吞噬
-
-## 名詞定義
-- 第 N 根：用來判斷觸及 MA20 的 K 棒
-- 第 N+1 根：用來判斷吞噬與進場的 K 棒
-- 觸及 MA20：Low <= MA20 <= High
-- 吞噬（做多）：Close > 前一根 max(Open, Close)
-- 吞噬（做空）：Close < 前一根 min(Open, Close)
-
-## 趨勢判斷
-- 多頭趨勢：
-  - MA20_slope > 0
-  - MA60_slope > 0
-  - MA20 > MA60
-- 空頭趨勢：
-  - MA20_slope < 0
-  - MA60_slope < 0
-  - MA20 < MA60
-
-## 進場規則
-### 多單
-同時滿足以下條件才進場：
-1. 多頭趨勢成立
-2. 第 N 根觸及 MA20（Low <= MA20 <= High）
-3. 第 N+1 根收盤 > 前一根 max(Open, Close)
-4. 第 N+1 根收盤 > MA20 且 > MA60
-5. 不跨日（第 N 與第 N+1 根必須在同一交易日）
-
-### 空單
-同時滿足以下條件才進場：
-1. 空頭趨勢成立
-2. 第 N 根觸及 MA20（Low <= MA20 <= High）
-3. 第 N+1 根收盤 < 前一根 min(Open, Close)
-4. 第 N+1 根收盤 < MA20 且 < MA60
-5. 不跨日（第 N 與第 N+1 根必須在同一交易日）
-
-## 出場規則
-- 多單：最新 K 棒收盤 < 前一根 min(Open, Close)
-- 空單：最新 K 棒收盤 > 前一根 max(Open, Close)
-
-## 風控規則
-- 套用「共通限制」。
-
----
-
-# 策略2：MA60/MA100 關鍵K吞噬
+# 策略1：MA60/MA100 關鍵K吞噬
 
 ## 名詞定義
 - 關鍵K（第 N 根）：以 buffer=10 判斷觸及，
   - `Low - 10 <= MA60 <= High + 10` 或
   - `Low - 10 <= MA100 <= High + 10`
-- 第 N+1 根：判斷是否「吞噬關鍵K close」的 K 棒
-- 多方吞噬：max(Open, Close) > 關鍵K Close
-- 空方吞噬：min(Open, Close) < 關鍵K Close
+- 第 N+1 根：用來判斷吞噬與進場的 K 棒
+- 多方吞噬：第 N+1 根 Close > 第 N 根 max(Open, Close)
+- 空方吞噬：第 N+1 根 Close < 第 N 根 min(Open, Close)
 
 ## 方向判斷（和 MA60 有關）
 - 多方：MA60_slope > 0 且當前 Close > MA60
@@ -86,16 +39,16 @@
 ## 進場規則
 ### 多單
 同時滿足以下條件才進場：
-1. 關鍵K 觸及 MA60 或 MA100
-2. 第 N+1 根 max(Open, Close) > 關鍵K Close
+1. 關鍵K 觸及 MA60 或 MA100（含 buffer）
+2. 第 N+1 根 Close > 第 N 根 max(Open, Close)
 3. 關鍵K 的 Open 與 Close 都 > 其觸碰到的 MA（MA60 或 MA100）
 4. MA60_slope > 0，且第 N+1 根 Close > MA60
 5. 不跨日（第 N 與第 N+1 根必須在同一交易日）
 
 ### 空單
 同時滿足以下條件才進場：
-1. 關鍵K 觸及 MA60 或 MA100
-2. 第 N+1 根 min(Open, Close) < 關鍵K Close
+1. 關鍵K 觸及 MA60 或 MA100（含 buffer）
+2. 第 N+1 根 Close < 第 N 根 min(Open, Close)
 3. 關鍵K 的 Open 與 Close 都 < 其觸碰到的 MA（MA60 或 MA100）
 4. MA60_slope < 0，且第 N+1 根 Close < MA60
 5. 不跨日（第 N 與第 N+1 根必須在同一交易日）

@@ -288,14 +288,14 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
     return trades, add_events
 
 
-def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_realtime=False):
+def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=False):
     """
-    策略2：MA60/MA100 關鍵K吞噬策略。
+    新策略1：MA60/MA100 關鍵K吞噬策略。
 
         進場定義：
         - 關鍵K（第N根）觸及判斷採 buffer：Low-10 <= MA <= High+10
-    - 多方：第N+1根 max(Open, Close) > 關鍵K close
-    - 空方：第N+1根 min(Open, Close) < 關鍵K close
+        - 多方：第N+1根 Close > 第N根 max(Open, Close)
+    - 空方：第N+1根 Close < 第N根 min(Open, Close)
         - 關鍵K close 位置：
             多方需關鍵K close > 觸碰到的 MA；空方需關鍵K close < 觸碰到的 MA
     並搭配：MA60 斜率方向、跨日不計、收盤前30分鐘不開新倉。
@@ -370,8 +370,8 @@ def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_
         ma60_up = (row_curr["MA60_slope"] > 0) and (row_curr["Close"] > row_curr["MA60"])
         ma60_down = (row_curr["MA60_slope"] < 0) and (row_curr["Close"] < row_curr["MA60"])
 
-        engulf_up = max(row_curr["Open"], row_curr["Close"]) > row_prev["Close"]
-        engulf_down = min(row_curr["Open"], row_curr["Close"]) < row_prev["Close"]
+        engulf_up = row_curr["Close"] > max(row_prev["Open"], row_prev["Close"])
+        engulf_down = row_curr["Close"] < min(row_prev["Open"], row_prev["Close"])
 
         prev_date = df.index[i - 1].date()
         curr_date = df.index[i].date()
@@ -381,12 +381,24 @@ def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_
         cutoff_reached = minutes_left <= 30
 
         if position is None:
-            if key_close_long_valid and ma60_up and engulf_up and same_day_signal and (not cutoff_reached):
+            if (
+                key_close_long_valid
+                and ma60_up
+                and engulf_up
+                and same_day_signal
+                and (not cutoff_reached)
+            ):
                 position = "LONG"
                 entry_idx = i
                 entry_price = row_curr["Close"]
                 bars_in_position = 1
-            elif key_close_short_valid and ma60_down and engulf_down and same_day_signal and (not cutoff_reached):
+            elif (
+                key_close_short_valid
+                and ma60_down
+                and engulf_down
+                and same_day_signal
+                and (not cutoff_reached)
+            ):
                 position = "SHORT"
                 entry_idx = i
                 entry_price = row_curr["Close"]
@@ -484,8 +496,10 @@ def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_
 
 
 def run_selected_strategy(df, strategy="strategy1", session="日盤", is_realtime=False):
-    """依策略代碼執行：strategy1 或 strategy2。"""
-    strategy_key = str(strategy).strip().lower()
-    if strategy_key in ("2", "strategy2", "ma60", "ma60_key"):
-        return calculate_ma60_key_engulfing_signals(df, session=session, is_realtime=is_realtime)
-    return calculate_ma_trend_engulfing_signals(df, session=session, is_realtime=is_realtime)
+    """統一執行新策略1。strategy 參數僅為相容舊介面保留。"""
+    return calculate_strategy1_signals(df, session=session, is_realtime=is_realtime)
+
+
+def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_realtime=False):
+    """相容舊名稱，實際委派至新策略1。"""
+    return calculate_strategy1_signals(df, min_bars=min_bars, session=session, is_realtime=is_realtime)
