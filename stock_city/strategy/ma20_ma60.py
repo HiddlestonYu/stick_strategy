@@ -3,6 +3,48 @@ import pytz
 import pandas as pd
 
 
+STRATEGY_MA60_MA100_SR_ENTRY = "ma60_ma100_sr_entry"
+
+
+def get_strategy_registry():
+    """策略註冊表（可擴充多策略）。"""
+    return {
+        STRATEGY_MA60_MA100_SR_ENTRY: {
+            "name": "MA60/MA100 撐壓進場",
+            "func": calculate_ma60_ma100_support_resistance_signals,
+        }
+    }
+
+
+def _normalize_strategy_keys(strategy):
+    """將單一/多個策略輸入統一轉成策略 key 清單。"""
+    if strategy is None:
+        return [STRATEGY_MA60_MA100_SR_ENTRY]
+
+    if isinstance(strategy, str):
+        raw_items = [item.strip().lower() for item in strategy.split(",") if item.strip()]
+    elif isinstance(strategy, (list, tuple, set)):
+        raw_items = [str(item).strip().lower() for item in strategy if str(item).strip()]
+    else:
+        raw_items = [str(strategy).strip().lower()]
+
+    alias_map = {
+        "1": STRATEGY_MA60_MA100_SR_ENTRY,
+        "strategy1": STRATEGY_MA60_MA100_SR_ENTRY,
+        "ma60_ma100": STRATEGY_MA60_MA100_SR_ENTRY,
+        "ma60_ma100_sr_entry": STRATEGY_MA60_MA100_SR_ENTRY,
+        "ma60_ma100_support_resistance_entry": STRATEGY_MA60_MA100_SR_ENTRY,
+    }
+
+    normalized = []
+    for key in raw_items:
+        mapped = alias_map.get(key, key)
+        if mapped not in normalized:
+            normalized.append(mapped)
+
+    return normalized or [STRATEGY_MA60_MA100_SR_ENTRY]
+
+
 def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_realtime=False):
     """
     計算 MA 趨勢觸及吞噬策略信號
@@ -288,9 +330,9 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
     return trades, add_events
 
 
-def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=False):
+def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="日盤", is_realtime=False):
     """
-    新策略1：MA60/MA100 關鍵K吞噬策略。
+    策略：MA60/MA100 撐壓進場。
 
         進場定義：
         - 關鍵K（第N根）觸及判斷採 buffer：Low-10 <= MA <= High+10
@@ -319,6 +361,28 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
     entry_idx = None
     entry_price = None
     bars_in_position = 0
+
+    def _compute_trade_excursions(start_idx, end_idx, direction, base_entry_price):
+        """計算單筆交易期間最大虧損/最大獲利（點）。"""
+        if start_idx is None or end_idx is None:
+            return 0.0, 0.0
+
+        window = df.iloc[int(start_idx): int(end_idx) + 1]
+        if window.empty:
+            return 0.0, 0.0
+
+        high_max = float(window["High"].max())
+        low_min = float(window["Low"].min())
+        entry_px = float(base_entry_price)
+
+        if direction == "LONG":
+            max_loss = max(0.0, entry_px - low_min)
+            max_profit = max(0.0, high_max - entry_px)
+        else:
+            max_loss = max(0.0, high_max - entry_px)
+            max_profit = max(0.0, entry_px - low_min)
+
+        return float(max_loss), float(max_profit)
 
     def minutes_to_session_close(ts):
         if not hasattr(ts, "tzinfo") or ts.tzinfo is None:
@@ -410,6 +474,7 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
         if cutoff_reached:
             exit_idx = i
             exit_price = row_curr["Close"]
+            max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
             trades.append({
                 "entry_idx": entry_idx,
                 "entry_ts": df.index[entry_idx],
@@ -420,6 +485,8 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
                 "direction": position,
                 "bars_held": bars_in_position,
                 "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+                "max_loss_points": max_loss_points,
+                "max_profit_points": max_profit_points,
                 "exit_reason": "收盤前30分鐘強制平倉",
             })
             position = None
@@ -437,6 +504,7 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
         if position == "LONG" and row_curr["Close"] < prev_body_low:
             exit_idx = i
             exit_price = row_curr["Close"]
+            max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
             trades.append({
                 "entry_idx": entry_idx,
                 "entry_ts": df.index[entry_idx],
@@ -447,6 +515,8 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
                 "direction": position,
                 "bars_held": bars_in_position,
                 "pnl": exit_price - entry_price,
+                "max_loss_points": max_loss_points,
+                "max_profit_points": max_profit_points,
                 "exit_reason": "多方出場(N+1收盤<前一根實體低點)",
             })
             position = None
@@ -458,6 +528,7 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
         if position == "SHORT" and row_curr["Close"] > prev_body_high:
             exit_idx = i
             exit_price = row_curr["Close"]
+            max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
             trades.append({
                 "entry_idx": entry_idx,
                 "entry_ts": df.index[entry_idx],
@@ -468,6 +539,8 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
                 "direction": position,
                 "bars_held": bars_in_position,
                 "pnl": entry_price - exit_price,
+                "max_loss_points": max_loss_points,
+                "max_profit_points": max_profit_points,
                 "exit_reason": "空方出場(N+1收盤>前一根實體高點)",
             })
             position = None
@@ -479,6 +552,7 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
     if (not is_realtime) and position is not None and entry_idx is not None:
         exit_idx = len(df) - 1
         exit_price = df.iloc[exit_idx]["Close"]
+        max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
         trades.append({
             "entry_idx": entry_idx,
             "entry_ts": df.index[entry_idx],
@@ -489,6 +563,8 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
             "direction": position,
             "bars_held": bars_in_position,
             "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+            "max_loss_points": max_loss_points,
+            "max_profit_points": max_profit_points,
             "exit_reason": "最後一根收盤",
         })
 
@@ -496,10 +572,58 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
 
 
 def run_selected_strategy(df, strategy="strategy1", session="日盤", is_realtime=False):
-    """統一執行新策略1。strategy 參數僅為相容舊介面保留。"""
-    return calculate_strategy1_signals(df, session=session, is_realtime=is_realtime)
+    """執行單一或多個策略，回傳合併後交易訊號。"""
+    registry = get_strategy_registry()
+    selected_keys = _normalize_strategy_keys(strategy)
+
+    all_trades = []
+    all_add_events = []
+
+    for strategy_key in selected_keys:
+        strategy_info = registry.get(strategy_key)
+        if strategy_info is None:
+            continue
+
+        strategy_func = strategy_info["func"]
+        strategy_name = strategy_info["name"]
+        trades, add_events = strategy_func(df, session=session, is_realtime=is_realtime)
+
+        for trade in trades:
+            trade_copy = dict(trade)
+            trade_copy["strategy_key"] = strategy_key
+            trade_copy["strategy_name"] = strategy_name
+            all_trades.append(trade_copy)
+        all_add_events.extend(add_events)
+
+    # 去除重複（多策略組合時避免相同交易重複顯示）
+    dedup_map = {}
+    for trade in all_trades:
+        dedup_key = (
+            trade.get("entry_idx"),
+            trade.get("exit_idx"),
+            trade.get("direction"),
+            float(trade.get("entry_price", 0)),
+            float(trade.get("exit_price", 0)),
+        )
+        if dedup_key not in dedup_map:
+            dedup_map[dedup_key] = trade
+
+    merged_trades = list(dedup_map.values())
+    merged_trades.sort(key=lambda item: (item.get("entry_idx", -1), item.get("exit_idx", -1)))
+
+    return merged_trades, all_add_events
+
+
+def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=False):
+    """相容舊名稱，實際委派至 MA60/MA100 撐壓進場。"""
+    return calculate_ma60_ma100_support_resistance_signals(
+        df,
+        min_bars=min_bars,
+        session=session,
+        is_realtime=is_realtime,
+    )
 
 
 def calculate_ma60_key_engulfing_signals(df, min_bars=105, session="日盤", is_realtime=False):
     """相容舊名稱，實際委派至新策略1。"""
-    return calculate_strategy1_signals(df, min_bars=min_bars, session=session, is_realtime=is_realtime)
+    return calculate_ma60_ma100_support_resistance_signals(df, min_bars=min_bars, session=session, is_realtime=is_realtime)

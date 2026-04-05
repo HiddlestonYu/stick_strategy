@@ -234,11 +234,11 @@ def run_backtest(interval: str, session: str, days: int, out_dir: str, bars_befo
 
 
 def main():
-    parser = argparse.ArgumentParser(description="新策略1（MA60/MA100 關鍵K吞噬）年度回測")
+    parser = argparse.ArgumentParser(description="MA60/MA100 撐壓進場（支援多策略）年度回測")
     parser.add_argument("--interval", default="5m", help="K 線週期，例如 1m/5m/15m/30m/60m/1d")
     parser.add_argument("--session", default="日盤", help="時段：日盤/夜盤/全盤")
     parser.add_argument("--days", type=int, default=365, help="回測天數")
-    parser.add_argument("--strategy", default="strategy1", choices=["strategy1", "1"], help="策略選擇：strategy1")
+    parser.add_argument("--strategy", default="ma60_ma100_sr_entry", help="策略 key，可用逗號分隔多策略（例如 ma60_ma100_sr_entry,strategy_x）")
     parser.add_argument("--out", default="backtest_outputs", help="輸出資料夾")
     parser.add_argument("--bars-before", type=int, default=20, help="進場前要截取的 K 棒數")
     parser.add_argument("--bars-after", type=int, default=20, help="進場後要截取的 K 棒數")
@@ -247,8 +247,9 @@ def main():
 
     taipei_tz = pytz.timezone("Asia/Taipei")
     now_str = datetime.now(taipei_tz).strftime("%Y%m%d_%H%M%S")
-    strategy_key = "strategy1"
-    out_dir = os.path.join(args.out, f"{strategy_key}_{args.session}_{args.interval}_{now_str}")
+    strategy_key = str(args.strategy).strip()
+    strategy_tag = strategy_key.replace(",", "+") if strategy_key else "ma60_ma100_sr_entry"
+    out_dir = os.path.join(args.out, f"{strategy_tag}_{args.session}_{args.interval}_{now_str}")
 
     trade_df, trade_csv, image_dir, total_trades, win_rate, total_pnl = run_backtest(
         interval=args.interval,

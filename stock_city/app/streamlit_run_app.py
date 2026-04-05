@@ -40,6 +40,18 @@ import sqlite3
 
 LOGIN_GAP_CHECK_DAYS = 30
 
+STRATEGY_OPTIONS = {
+    "ma60_ma100_sr_entry": "MA60/MA100 撐壓進場",
+}
+
+AUTO_BACKTEST_PERIOD_OPTIONS = {
+    "1個月": 30,
+    "1季": 90,
+    "半年": 180,
+    "1年": 365,
+    "2年": 730,
+}
+
 # ============================================================
 # 1. 頁面初始化設定與 Shioaji 連線
 # ============================================================
@@ -79,62 +91,82 @@ def login_shioaji(api_key=None, secret_key=None, cert_path=None, cert_password=N
     返回:
         tuple: (api實例, 錯誤訊息)
     """
-    try:
-        # 建立新的 API 實例以避免快取問題
-        api = sj.Shioaji()
-        
-        # 決定是否下載合約資料
-        contracts_cb = lambda security_type: print(f"{repr(security_type)} fetch done.") if fetch_contract else None
-        
-        # 根據提供的參數決定登入方式
-        if cert_path:
-            # 使用憑證檔案登入
-            if fetch_contract:
-                result = api.login(
-                    person_id=api_key,
-                    passwd=cert_password,
-                    contracts_cb=contracts_cb
-                )
-            else:
-                result = api.login(
-                    person_id=api_key,
-                    passwd=cert_password
-                )
-        else:
-            # 使用 API Key 登入
-            if fetch_contract:
-                result = api.login(
-                    api_key=api_key, 
-                    secret_key=secret_key,
-                    contracts_cb=contracts_cb
-                )
-            else:
-                result = api.login(
-                    api_key=api_key, 
-                    secret_key=secret_key
-                )
-        
-        # 檢查登入結果
-        if hasattr(result, 'get'):
-            status = result.get('status', {})
-            if isinstance(status, dict):
-                status_code = status.get('status_code', 0)
-                if status_code == 200:
-                    return api, None
+    def _is_too_many_connections(message: str) -> bool:
+        msg = str(message or "")
+        return ("Too Many Connections" in msg) or ("連線數過多" in msg)
+
+    max_attempts = 2
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # 建立新的 API 實例以避免快取問題
+            api = sj.Shioaji()
+
+            # 決定是否下載合約資料
+            contracts_cb = lambda security_type: print(f"{repr(security_type)} fetch done.") if fetch_contract else None
+
+            # 根據提供的參數決定登入方式
+            if cert_path:
+                # 使用憑證檔案登入
+                if fetch_contract:
+                    result = api.login(
+                        person_id=api_key,
+                        passwd=cert_password,
+                        contracts_cb=contracts_cb
+                    )
                 else:
-                    # 登入失敗，返回詳細錯誤
+                    result = api.login(
+                        person_id=api_key,
+                        passwd=cert_password
+                    )
+            else:
+                # 使用 API Key 登入
+                if fetch_contract:
+                    result = api.login(
+                        api_key=api_key,
+                        secret_key=secret_key,
+                        contracts_cb=contracts_cb
+                    )
+                else:
+                    result = api.login(
+                        api_key=api_key,
+                        secret_key=secret_key
+                    )
+
+            # 檢查登入結果
+            if hasattr(result, 'get'):
+                status = result.get('status', {})
+                if isinstance(status, dict):
+                    status_code = status.get('status_code', 0)
+                    if status_code == 200:
+                        return api, None
+
                     detail = result.get('response', {}).get('detail', '未知錯誤')
-                    return None, f"狀態碼: {status_code}, 詳情: {detail}"
-        
-        # 如果沒有錯誤，視為成功
-        return api, None
-        
-    except Exception as e:
-        # 捕捉詳細的異常訊息
-        error_msg = str(e)
-        if 'Too Many Connections' in error_msg:
-            return None, "連線數過多，請稍後再試或先登出其他連線"
-        return None, error_msg
+                    error_msg = f"狀態碼: {status_code}, 詳情: {detail}"
+                    last_error = error_msg
+
+                    if _is_too_many_connections(error_msg) and attempt < max_attempts:
+                        time.sleep(2)
+                        continue
+                    if _is_too_many_connections(error_msg):
+                        return None, "連線數過多，系統已自動重試仍失敗。請先點『🔓 登出』或『🔄 強制重置』，等待 1-2 分鐘後再試。"
+                    return None, error_msg
+
+            # 如果沒有錯誤，視為成功
+            return api, None
+
+        except Exception as e:
+            error_msg = str(e)
+            last_error = error_msg
+            if _is_too_many_connections(error_msg) and attempt < max_attempts:
+                time.sleep(2)
+                continue
+            if _is_too_many_connections(error_msg):
+                return None, "連線數過多，系統已自動重試仍失敗。請先點『🔓 登出』或『🔄 強制重置』，等待 1-2 分鐘後再試。"
+            return None, error_msg
+
+    return None, (last_error or "登入失敗")
 
 # 嘗試初始化 Shioaji
 api = init_shioaji()
@@ -419,6 +451,7 @@ with st.sidebar:
                                 if 'shioaji_api' in st.session_state and st.session_state['shioaji_api']:
                                     try:
                                         st.session_state['shioaji_api'].logout()
+                                        time.sleep(2)
                                     except:
                                         pass
                                     st.session_state.pop('shioaji_api', None)
@@ -437,8 +470,19 @@ with st.sidebar:
                                     st.session_state['login_gap_check_days'] = LOGIN_GAP_CHECK_DAYS
                                     st.rerun()
                                 else:
-                                    st.error(f"❌ 登入失敗: {error if error else '未知錯誤'}")
-                                    st.warning("💡 提示: 如果出現連線數過多，請稍等1-2分鐘或聯繫永豐證券客服")
+                                    error_str = str(error) if error else '未知錯誤'
+                                    st.error(f"❌ 登入失敗: {error_str}")
+                                    if '連線數過多' in error_str or 'Too Many Connections' in error_str:
+                                        st.warning("🔗 連線數過多：系統已自動重試 1 次，仍失敗")
+                                        st.info(
+                                            "建議操作：\n"
+                                            "1) 點『🔓 登出』關閉舊連線\n"
+                                            "2) 點『🔄 強制重置』清除狀態\n"
+                                            "3) 等待 1-2 分鐘後再登入\n"
+                                            "4) 關閉其他正在使用同帳號的程式/分頁"
+                                        )
+                                    else:
+                                        st.warning("💡 提示: 請檢查 API Key / Secret Key 是否正確，或稍後再試")
                                     st.session_state['shioaji_logged_in'] = False
                             except Exception as e:
                                 st.error(f"❌ 登入失敗: {str(e)}")
@@ -558,7 +602,7 @@ with st.sidebar:
     # ============================================================
     # 3.7 策略設定
     # ============================================================
-    with st.expander("🎯 MA交叉吞噬策略", expanded=False):
+    with st.expander("🎯 策略設定", expanded=False):
         enable_strategy = st.checkbox(
             "啟用策略信號",
             value=False,
@@ -567,8 +611,35 @@ with st.sidebar:
         st.session_state["enable_strategy"] = enable_strategy
         
         if enable_strategy:
+            selected_strategy_keys = st.multiselect(
+                "選擇策略（可複選）",
+                options=list(STRATEGY_OPTIONS.keys()),
+                default=st.session_state.get("selected_strategy_keys", ["ma60_ma100_sr_entry"]),
+                format_func=lambda key: STRATEGY_OPTIONS.get(key, key),
+                help="目前僅提供一個策略，後續可擴充為多策略組合判斷。",
+            )
+            if not selected_strategy_keys:
+                selected_strategy_keys = ["ma60_ma100_sr_entry"]
+            st.session_state["selected_strategy_keys"] = selected_strategy_keys
+
+            enable_auto_backtest = st.checkbox(
+                "啟用自動回測結果",
+                value=st.session_state.get("enable_auto_backtest", False),
+                help="啟用後會依下方期間自動計算策略回測摘要。",
+            )
+            st.session_state["enable_auto_backtest"] = bool(enable_auto_backtest)
+
+            auto_backtest_period = st.selectbox(
+                "自動回測期間",
+                tuple(AUTO_BACKTEST_PERIOD_OPTIONS.keys()),
+                index=list(AUTO_BACKTEST_PERIOD_OPTIONS.keys()).index(
+                    st.session_state.get("auto_backtest_period", "1年")
+                ) if st.session_state.get("auto_backtest_period", "1年") in AUTO_BACKTEST_PERIOD_OPTIONS else 3,
+            )
+            st.session_state["auto_backtest_period"] = auto_backtest_period
+
             st.info(
-                "📌 **新策略1規則（MA60/MA100 關鍵K吞噬）**\n\n"
+                "📌 **策略：MA60/MA100 撐壓進場**\n\n"
                 "• **關鍵K**：第N根以 buffer 判斷觸及 MA60 或 MA100\n"
                 "• **多方吞噬**：第N+1根 Close > 第N根 max(Open, Close)\n"
                 "• **空方吞噬**：第N+1根 Close < 第N根 min(Open, Close)\n"
@@ -1911,6 +1982,269 @@ def process_kline_data(df, interval, session):
     return df
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def get_backtest_data_from_db(interval: str, session: str, days: int):
+    """讀取回測資料（短 TTL，供自動回測使用）。"""
+    return get_kbars_from_db(interval=interval, session=session, days=days)
+
+
+def _ensure_ma_columns_for_export(df: pd.DataFrame) -> pd.DataFrame:
+    """確保匯出截圖所需均線欄位存在。"""
+    df = df.copy()
+    if "MA20" not in df.columns:
+        df["MA20"] = df["Close"].rolling(window=20).mean()
+    if "MA60" not in df.columns:
+        df["MA60"] = df["Close"].rolling(window=60).mean()
+    return df
+
+
+def _plot_trade_window_for_export(
+    df: pd.DataFrame,
+    entry_idx: int,
+    exit_idx: int,
+    direction: str,
+    bars_before: int = 20,
+    bars_after: int = 20,
+):
+    """繪製單筆交易視窗圖（K棒 + 均線 + 成交量）。"""
+    start = max(0, entry_idx - bars_before)
+    end = min(len(df), entry_idx + bars_after + 1)
+    df_window = df.iloc[start:end]
+
+    date_labels = df_window.index.strftime("%Y-%m-%d %H:%M")
+    x_range = list(range(len(df_window)))
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=("K 線與均線", "成交量"),
+        row_width=[0.15, 0.85],
+    )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=x_range,
+            open=df_window["Open"],
+            high=df_window["High"],
+            low=df_window["Low"],
+            close=df_window["Close"],
+            name="K棒",
+            increasing_line_color="red",
+            decreasing_line_color="green",
+            increasing_line_width=2,
+            decreasing_line_width=2,
+            text=date_labels,
+            hovertext=date_labels,
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_range,
+            y=df_window["MA20"],
+            line=dict(color="orange", width=1.5),
+            name="20 MA",
+            text=date_labels,
+            hovertext=date_labels,
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_range,
+            y=df_window["MA60"],
+            line=dict(color="purple", width=1.5),
+            name="60 MA",
+            text=date_labels,
+            hovertext=date_labels,
+        ),
+        row=1,
+        col=1,
+    )
+
+    entry_local_idx = entry_idx - start
+    exit_local_idx = exit_idx - start
+    if exit_local_idx < 0 or exit_local_idx >= len(df_window):
+        exit_local_idx = None
+
+    fig.add_trace(
+        go.Scatter(
+            x=[entry_local_idx],
+            y=[df_window.iloc[entry_local_idx]["Close"]],
+            mode="markers",
+            marker=dict(size=12, symbol="triangle-up", color="yellow", line=dict(color="black", width=1)),
+            name="進場",
+            text=[date_labels[entry_local_idx]],
+        ),
+        row=1,
+        col=1,
+    )
+
+    if exit_local_idx is not None:
+        exit_symbol = "x"
+        exit_color = "cyan" if direction == "LONG" else "magenta"
+        fig.add_trace(
+            go.Scatter(
+                x=[exit_local_idx],
+                y=[df_window.iloc[exit_local_idx]["Close"]],
+                mode="markers",
+                marker=dict(size=11, symbol=exit_symbol, color=exit_color, line=dict(color="black", width=1)),
+                name="出場",
+                text=[date_labels[exit_local_idx]],
+            ),
+            row=1,
+            col=1,
+        )
+
+    colors = ["red" if row["Open"] - row["Close"] >= 0 else "green" for _, row in df_window.iterrows()]
+    fig.add_trace(
+        go.Bar(
+            x=x_range,
+            y=df_window["Volume"],
+            marker_color=colors,
+            name="成交量",
+            text=date_labels,
+            hovertext=date_labels,
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.update_layout(
+        xaxis_rangeslider=dict(visible=False),
+        height=700,
+        plot_bgcolor="rgb(20, 20, 20)",
+        paper_bgcolor="rgb(20, 20, 20)",
+        font=dict(color="white"),
+        hovermode="x unified",
+        transition=dict(duration=0),
+    )
+
+    tick_spacing = max(1, len(df_window) // 6)
+    tickvals = list(range(0, len(df_window), tick_spacing))
+    ticktext = [date_labels[i] for i in tickvals]
+    fig.update_xaxes(tickvals=tickvals, ticktext=ticktext, tickangle=-45)
+
+    return fig
+
+
+def export_backtest_results_to_folder(
+    bt_trades,
+    interval: str,
+    session: str,
+    period_label: str,
+    selected_strategy_keys,
+    source_df: pd.DataFrame | None = None,
+):
+    """將回測結果輸出到 backtest_outputs 資料夾。"""
+    taipei_tz = pytz.timezone("Asia/Taipei")
+    now_str = datetime.now(taipei_tz).strftime("%Y%m%d_%H%M%S")
+
+    strategy_keys = [str(key) for key in (selected_strategy_keys or ["ma60_ma100_sr_entry"])]
+    strategy_tag = "+".join(strategy_keys)
+
+    output_root = "backtest_outputs"
+    os.makedirs(output_root, exist_ok=True)
+
+    folder_name = f"auto_{strategy_tag}_{session}_{interval}_{period_label}_{now_str}"
+    out_dir = os.path.join(output_root, folder_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    records = []
+    for i, trade in enumerate(bt_trades, 1):
+        entry_ts = trade.get("entry_ts")
+        exit_ts = trade.get("exit_ts")
+        records.append(
+            {
+                "id": i,
+                "strategy_key": trade.get("strategy_key", ""),
+                "strategy_name": trade.get("strategy_name", ""),
+                "direction": trade.get("direction", ""),
+                "entry_ts": entry_ts,
+                "entry_price": float(trade.get("entry_price", 0) or 0),
+                "exit_ts": exit_ts,
+                "exit_price": float(trade.get("exit_price", 0) or 0),
+                "bars_held": int(trade.get("bars_held", 0) or 0),
+                "pnl": float(trade.get("pnl", 0) or 0),
+                "max_loss_points": float(trade.get("max_loss_points", 0) or 0),
+                "max_profit_points": float(trade.get("max_profit_points", 0) or 0),
+                "exit_reason": trade.get("exit_reason", ""),
+            }
+        )
+
+    trades_df = pd.DataFrame(records)
+    trade_csv_path = os.path.join(out_dir, "trades.csv")
+    trades_df.to_csv(trade_csv_path, index=False, encoding="utf-8-sig")
+
+    total_trades = len(bt_trades)
+    total_pnl = float(sum(t.get("pnl", 0) for t in bt_trades)) if total_trades > 0 else 0.0
+    win_trades = int(sum(1 for t in bt_trades if float(t.get("pnl", 0)) > 0)) if total_trades > 0 else 0
+    loss_trades = int(sum(1 for t in bt_trades if float(t.get("pnl", 0)) < 0)) if total_trades > 0 else 0
+    win_rate = (win_trades / total_trades * 100.0) if total_trades > 0 else 0.0
+
+    summary_df = pd.DataFrame(
+        [
+            {
+                "generated_at": datetime.now(taipei_tz).strftime("%Y-%m-%d %H:%M:%S"),
+                "strategy_keys": strategy_tag,
+                "session": session,
+                "interval": interval,
+                "period": period_label,
+                "total_trades": total_trades,
+                "win_trades": win_trades,
+                "loss_trades": loss_trades,
+                "win_rate": round(win_rate, 2),
+                "total_pnl": round(total_pnl, 2),
+            }
+        ]
+    )
+    summary_csv_path = os.path.join(out_dir, "summary.csv")
+    summary_df.to_csv(summary_csv_path, index=False, encoding="utf-8-sig")
+
+    image_dir = os.path.join(out_dir, "trade_images")
+    os.makedirs(image_dir, exist_ok=True)
+
+    image_success = 0
+    image_fail = 0
+    source_df_local = source_df
+
+    if source_df_local is not None and not source_df_local.empty and len(bt_trades) > 0:
+        source_df_local = _ensure_ma_columns_for_export(source_df_local)
+        for i, trade in enumerate(bt_trades, 1):
+            try:
+                entry_idx = int(trade.get("entry_idx"))
+                exit_idx = int(trade.get("exit_idx"))
+                if entry_idx < 0 or exit_idx < 0:
+                    image_fail += 1
+                    continue
+
+                entry_ts = trade.get("entry_ts")
+                entry_date = entry_ts.strftime("%Y%m%d") if hasattr(entry_ts, "strftime") else f"{i:03d}"
+                direction = str(trade.get("direction", "UNK"))
+                filename = f"{entry_date}_{direction}_{i:03d}.png"
+
+                fig = _plot_trade_window_for_export(
+                    source_df_local,
+                    entry_idx=entry_idx,
+                    exit_idx=exit_idx,
+                    direction=direction,
+                    bars_before=20,
+                    bars_after=20,
+                )
+                fig.write_image(os.path.join(image_dir, filename))
+                image_success += 1
+            except Exception:
+                image_fail += 1
+
+    return out_dir, trade_csv_path, summary_csv_path, image_dir, image_success, image_fail
+
+
 def apply_realtime_snapshot_to_kbars(df: pd.DataFrame, interval: str, latest_price: float) -> pd.DataFrame:
     """用最新價格即時更新最後一根 K 棒。
 
@@ -2269,9 +2603,9 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
     return trades, add_events
 
 
-def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=False):
+def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="日盤", is_realtime=False):
     """
-    新策略1：MA60/MA100 關鍵K 吞噬策略
+    策略：MA60/MA100 撐壓進場
 
     規則：
     1. 關鍵K（第N根）觸及判斷採 buffer：Low-10 <= MA <= High+10
@@ -2300,6 +2634,28 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
     entry_idx = None
     entry_price = None
     bars_in_position = 0
+
+    def _compute_trade_excursions(start_idx, end_idx, direction, base_entry_price):
+        """計算單筆交易期間最大虧損/最大獲利（點）。"""
+        if start_idx is None or end_idx is None:
+            return 0.0, 0.0
+
+        window = df.iloc[int(start_idx): int(end_idx) + 1]
+        if window.empty:
+            return 0.0, 0.0
+
+        high_max = float(window["High"].max())
+        low_min = float(window["Low"].min())
+        entry_px = float(base_entry_price)
+
+        if direction == "LONG":
+            max_loss = max(0.0, entry_px - low_min)
+            max_profit = max(0.0, high_max - entry_px)
+        else:
+            max_loss = max(0.0, high_max - entry_px)
+            max_profit = max(0.0, entry_px - low_min)
+
+        return float(max_loss), float(max_profit)
 
     def minutes_to_session_close(ts):
         if not hasattr(ts, "tzinfo") or ts.tzinfo is None:
@@ -2391,6 +2747,7 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
         if cutoff_reached:
             exit_idx = i
             exit_price = row_curr["Close"]
+            max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
             trades.append({
                 "entry_idx": entry_idx,
                 "entry_ts": df.index[entry_idx],
@@ -2401,6 +2758,8 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
                 "direction": position,
                 "bars_held": bars_in_position,
                 "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+                "max_loss_points": max_loss_points,
+                "max_profit_points": max_profit_points,
                 "exit_reason": "收盤前30分鐘強制平倉",
             })
             position = None
@@ -2418,6 +2777,7 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
         if position == "LONG" and row_curr["Close"] < prev_body_low:
             exit_idx = i
             exit_price = row_curr["Close"]
+            max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
             trades.append({
                 "entry_idx": entry_idx,
                 "entry_ts": df.index[entry_idx],
@@ -2428,6 +2788,8 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
                 "direction": position,
                 "bars_held": bars_in_position,
                 "pnl": exit_price - entry_price,
+                "max_loss_points": max_loss_points,
+                "max_profit_points": max_profit_points,
                 "exit_reason": "多方出場(N+1收盤<前一根實體低點)",
             })
             position = None
@@ -2439,6 +2801,7 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
         if position == "SHORT" and row_curr["Close"] > prev_body_high:
             exit_idx = i
             exit_price = row_curr["Close"]
+            max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
             trades.append({
                 "entry_idx": entry_idx,
                 "entry_ts": df.index[entry_idx],
@@ -2449,6 +2812,8 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
                 "direction": position,
                 "bars_held": bars_in_position,
                 "pnl": entry_price - exit_price,
+                "max_loss_points": max_loss_points,
+                "max_profit_points": max_profit_points,
                 "exit_reason": "空方出場(N+1收盤>前一根實體高點)",
             })
             position = None
@@ -2460,6 +2825,7 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
     if (not is_realtime) and position is not None and entry_idx is not None:
         exit_idx = len(df) - 1
         exit_price = df.iloc[exit_idx]["Close"]
+        max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
         trades.append({
             "entry_idx": entry_idx,
             "entry_ts": df.index[entry_idx],
@@ -2470,15 +2836,72 @@ def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=
             "direction": position,
             "bars_held": bars_in_position,
             "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+            "max_loss_points": max_loss_points,
+            "max_profit_points": max_profit_points,
             "exit_reason": "最後一根收盤",
         })
 
     return trades, add_events
 
 
-def run_selected_strategy(df, session="日盤", is_realtime=False):
-    """統一執行新策略1。"""
-    return calculate_strategy1_signals(df, session=session, is_realtime=is_realtime)
+def run_selected_strategy(df, session="日盤", is_realtime=False, strategies=None):
+    """執行單一或多個策略（可擴充多策略組合）。"""
+    strategy_dispatch = {
+        "ma60_ma100_sr_entry": {
+            "name": "MA60/MA100 撐壓進場",
+            "func": calculate_ma60_ma100_support_resistance_signals,
+        }
+    }
+
+    selected_keys = strategies if strategies is not None else st.session_state.get("selected_strategy_keys", ["ma60_ma100_sr_entry"])
+    if isinstance(selected_keys, str):
+        selected_keys = [selected_keys]
+    selected_keys = [key for key in selected_keys if key in strategy_dispatch]
+    if not selected_keys:
+        selected_keys = ["ma60_ma100_sr_entry"]
+
+    all_trades = []
+    all_add_events = []
+
+    for strategy_key in selected_keys:
+        strategy_info = strategy_dispatch[strategy_key]
+        strategy_func = strategy_info["func"]
+        strategy_name = strategy_info["name"]
+
+        trades, add_events = strategy_func(df, session=session, is_realtime=is_realtime)
+        for trade in trades:
+            trade_copy = dict(trade)
+            trade_copy["strategy_key"] = strategy_key
+            trade_copy["strategy_name"] = strategy_name
+            all_trades.append(trade_copy)
+        all_add_events.extend(add_events)
+
+    # 多策略組合時，去除重複交易
+    dedup_map = {}
+    for trade in all_trades:
+        dedup_key = (
+            trade.get("entry_idx"),
+            trade.get("exit_idx"),
+            trade.get("direction"),
+            float(trade.get("entry_price", 0)),
+            float(trade.get("exit_price", 0)),
+        )
+        if dedup_key not in dedup_map:
+            dedup_map[dedup_key] = trade
+
+    merged_trades = list(dedup_map.values())
+    merged_trades.sort(key=lambda item: (item.get("entry_idx", -1), item.get("exit_idx", -1)))
+    return merged_trades, all_add_events
+
+
+def calculate_strategy1_signals(df, min_bars=105, session="日盤", is_realtime=False):
+    """相容舊名稱，實際委派至 MA60/MA100 撐壓進場。"""
+    return calculate_ma60_ma100_support_resistance_signals(
+        df,
+        min_bars=min_bars,
+        session=session,
+        is_realtime=is_realtime,
+    )
 
 # 主要數據獲取函數
 def get_data(interval, product, session, max_kbars, use_shioaji=False, api_instance=None):
@@ -2499,18 +2922,56 @@ def get_data(interval, product, session, max_kbars, use_shioaji=False, api_insta
     data_source = ""
     is_realtime = False
 
+    # 讀取進度條（time bar）：顯示本次更新耗時與預估剩餘時間
+    load_start_ts = time.time()
+    avg_key = "data_load_avg_seconds"
+    estimated_total_seconds = float(st.session_state.get(avg_key, 6.0) or 6.0)
+    estimated_total_seconds = max(2.0, min(estimated_total_seconds, 30.0))
+    progress_placeholder = st.empty()
+    status_placeholder = st.empty()
+    load_progress = progress_placeholder.progress(0)
+
+    def _update_load_progress(percent: int, stage_text: str):
+        elapsed = time.time() - load_start_ts
+        remaining = max(0.0, estimated_total_seconds - elapsed)
+        load_progress.progress(int(max(0, min(100, percent))))
+        status_placeholder.caption(
+            f"⏳ 資料更新中：{stage_text}｜{int(percent)}%｜已耗時 {elapsed:.1f}s｜預估剩餘 {remaining:.1f}s"
+        )
+
+    def _finish_load_progress(message: str, success: bool):
+        elapsed = time.time() - load_start_ts
+        if success:
+            load_progress.progress(100)
+            status_placeholder.caption(f"✅ {message}｜本次耗時 {elapsed:.1f}s")
+            previous_avg = st.session_state.get(avg_key)
+            if previous_avg is None:
+                st.session_state[avg_key] = round(elapsed, 2)
+            else:
+                st.session_state[avg_key] = round(float(previous_avg) * 0.7 + elapsed * 0.3, 2)
+        else:
+            status_placeholder.caption(f"⚠️ {message}｜本次耗時 {elapsed:.1f}s")
+
+    _update_load_progress(8, "初始化參數")
+
     # 檢查市場狀態
     market_status_text, market_is_open, market_session = get_market_status()
+
+    _update_load_progress(20, "檢查市場狀態")
 
     # 一律優先從 SQLite DB 讀取顯示；若已登入 Shioaji，才啟用自動更新回填
     if use_shioaji and api_instance is not None:
         st.sidebar.info("🔄 使用 DB 顯示（並由 Shioaji 自動更新回填）...")
+        _update_load_progress(45, "讀取 DB 與同步 Shioaji")
         df = get_data_from_shioaji(api_instance, interval, product, session, max_kbars)
         data_source = "SQLite DB（自動更新：Shioaji）"
     else:
         st.sidebar.info("📊 使用 DB 顯示（未登入 Shioaji，僅讀取不回填）")
+        _update_load_progress(45, "讀取 DB 歷史資料")
         df = get_data_from_shioaji(None, interval, product, session, max_kbars)
         data_source = "SQLite DB（僅讀取）"
+
+    _update_load_progress(72, "資料讀取完成，分析資料新鮮度")
 
     # 即時/歷史判斷：開盤中且 DB 最新時間足夠新鮮
     try:
@@ -2535,14 +2996,19 @@ def get_data(interval, product, session, max_kbars, use_shioaji=False, api_insta
             "2. 系統會自動更新今日及後續數據\n"
             "3. 首次可能需要 2-3 分鐘建立連線"
         )
+        _finish_load_progress("目前無可用數據", success=False)
         return None, "無可用數據", False
     
     # 處理數據並計算技術指標
+    _update_load_progress(86, "計算技術指標")
     processed_df = process_kline_data(df, interval, session)
     
     if processed_df is None or processed_df.empty:
         st.sidebar.error("❌ 數據處理失敗")
+        _finish_load_progress("數據處理失敗", success=False)
         return None, data_source, is_realtime
+
+    _finish_load_progress("資料更新完成", success=True)
     
     return processed_df, data_source, is_realtime
 
@@ -2987,16 +3453,22 @@ if df is not None:
     # 5.6.0 策略選擇（K 線圖下方）
     # ------------------------------------------------------------
     st.checkbox(
-        "啟用策略信號（新策略1）",
+        "啟用策略信號（策略可複選）",
         value=st.session_state.get("enable_strategy", False),
         key="enable_strategy",
-        help="新策略1：MA60/MA100 關鍵K吞噬"
+        help="目前策略：MA60/MA100 撐壓進場（後續可擴充多策略組合）。"
     )
     # ============================================================
     # 5.6.1 顯示策略交易紀錄
     # ============================================================
     if st.session_state.get("enable_strategy", False):
-        trades, _ = run_selected_strategy(df, session=session_option, is_realtime=is_realtime)
+        selected_strategy_keys = st.session_state.get("selected_strategy_keys", ["ma60_ma100_sr_entry"])
+        trades, _ = run_selected_strategy(
+            df,
+            session=session_option,
+            is_realtime=is_realtime,
+            strategies=selected_strategy_keys,
+        )
         
         if trades:
             with st.expander("📋 交易紀錄", expanded=True):
@@ -3018,6 +3490,8 @@ if df is not None:
                         "退場價": f"{trade['exit_price']:.0f}",
                         "方向": trade["direction"],
                         "持倉K棒數": trade["bars_held"],
+                        "最大虧損": f"-{float(trade.get('max_loss_points', 0)):.0f}",
+                        "最大獲利": f"+{float(trade.get('max_profit_points', 0)):.0f}",
                         "退場原因": trade.get("exit_reason", ""),
                         "損益": f"{trade['pnl']:+.0f}"
                     })
@@ -3045,8 +3519,106 @@ if df is not None:
                 col_stats5.metric("獲利筆數", win_trades)
                 col_stats6.metric("虧損筆數", loss_trades)
                 col_stats7.metric("勝率", f"{win_rate:.1f}%")
+
+                export_trades_key = (
+                    f"export_trades_{interval_option}_{session_option}_{'+'.join(selected_strategy_keys)}"
+                )
+                if st.button("💾 匯出交易紀錄到 backtest_outputs", key=export_trades_key, use_container_width=True):
+                    try:
+                        out_dir, trade_csv_path, summary_csv_path, image_dir, image_success, image_fail = export_backtest_results_to_folder(
+                            bt_trades=trades,
+                            interval=interval_option,
+                            session=session_option,
+                            period_label="目前視窗",
+                            selected_strategy_keys=selected_strategy_keys,
+                            source_df=df,
+                        )
+                        st.success(f"✅ 已輸出交易紀錄到資料夾：{out_dir}")
+                        st.caption(f"📄 明細：{trade_csv_path}")
+                        st.caption(f"📊 摘要：{summary_csv_path}")
+                        st.caption(f"🖼️ 圖片：{image_dir}（成功 {image_success} 張，失敗 {image_fail} 張）")
+                    except Exception as export_error:
+                        st.error(f"❌ 匯出失敗: {str(export_error)}")
         else:
             st.info("ℹ️ 未找到符合策略的交易信號，請調整條件或檢查K棒數據")
+
+    # ============================================================
+    # 5.6.2 自動回測結果
+    # ============================================================
+    if st.session_state.get("enable_strategy", False) and st.session_state.get("enable_auto_backtest", False):
+        selected_strategy_keys = st.session_state.get("selected_strategy_keys", ["ma60_ma100_sr_entry"])
+        period_label = st.session_state.get("auto_backtest_period", "1年")
+        period_days = int(AUTO_BACKTEST_PERIOD_OPTIONS.get(period_label, 365))
+
+        with st.expander(f"📈 自動回測結果（{period_label}）", expanded=False):
+            bt_df_raw = get_backtest_data_from_db(interval_option, session_option, period_days)
+            bt_df = process_kline_data(bt_df_raw, interval_option, session_option)
+
+            if bt_df is None or bt_df.empty:
+                st.info("ℹ️ 回測期間內無可用資料，請調整期間或先回填資料。")
+            else:
+                bt_trades, _ = run_selected_strategy(
+                    bt_df,
+                    session=session_option,
+                    is_realtime=False,
+                    strategies=selected_strategy_keys,
+                )
+
+                bt_total = len(bt_trades)
+                bt_total_pnl = float(sum(t.get("pnl", 0) for t in bt_trades)) if bt_total > 0 else 0.0
+                bt_win = int(sum(1 for t in bt_trades if float(t.get("pnl", 0)) > 0)) if bt_total > 0 else 0
+                bt_loss = int(sum(1 for t in bt_trades if float(t.get("pnl", 0)) < 0)) if bt_total > 0 else 0
+                bt_win_rate = (bt_win / bt_total * 100.0) if bt_total > 0 else 0.0
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("回測筆數", bt_total)
+                c2.metric("勝率", f"{bt_win_rate:.1f}%")
+                c3.metric("總損益", f"{bt_total_pnl:+.0f}")
+                c4.metric("資料範圍", f"{period_days} 天")
+
+                c5, c6 = st.columns(2)
+                c5.metric("獲利筆數", bt_win)
+                c6.metric("虧損筆數", bt_loss)
+
+                if bt_total > 0:
+                    bt_records = []
+                    for i, trade in enumerate(bt_trades[-20:], 1):
+                        entry_ts = trade.get("entry_ts")
+                        exit_ts = trade.get("exit_ts")
+                        bt_records.append(
+                            {
+                                "序": i,
+                                "策略": trade.get("strategy_name", ""),
+                                "方向": trade.get("direction", ""),
+                                "進場": entry_ts.strftime('%m-%d %H:%M') if hasattr(entry_ts, 'strftime') else str(entry_ts),
+                                "退場": exit_ts.strftime('%m-%d %H:%M') if hasattr(exit_ts, 'strftime') else str(exit_ts),
+                                "最大虧損": f"-{float(trade.get('max_loss_points', 0)):.0f}",
+                                "最大獲利": f"+{float(trade.get('max_profit_points', 0)):.0f}",
+                                "損益": f"{float(trade.get('pnl', 0)):+.0f}",
+                            }
+                        )
+                    st.dataframe(pd.DataFrame(bt_records), use_container_width=True, hide_index=True)
+
+                export_key = (
+                    f"export_backtest_{interval_option}_{session_option}_{period_label}_"
+                    f"{'+'.join(selected_strategy_keys)}"
+                )
+                if st.button("💾 匯出回測結果到 backtest_outputs", key=export_key, use_container_width=True):
+                    try:
+                        out_dir, trade_csv_path, summary_csv_path, image_dir, image_success, image_fail = export_backtest_results_to_folder(
+                            bt_trades=bt_trades,
+                            interval=interval_option,
+                            session=session_option,
+                            period_label=period_label,
+                            selected_strategy_keys=selected_strategy_keys,
+                            source_df=bt_df,
+                        )
+                        st.success(f"✅ 已輸出回測結果到資料夾：{out_dir}")
+                        st.caption(f"📄 明細：{trade_csv_path}")
+                        st.caption(f"📊 摘要：{summary_csv_path}")
+                        st.caption(f"🖼️ 圖片：{image_dir}（成功 {image_success} 張，失敗 {image_fail} 張）")
+                    except Exception as export_error:
+                        st.error(f"❌ 匯出失敗: {str(export_error)}")
 
 
     # ------------------------------------------------------------
