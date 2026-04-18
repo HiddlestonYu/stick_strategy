@@ -52,6 +52,13 @@ AUTO_BACKTEST_PERIOD_OPTIONS = {
     "2年": 730,
 }
 
+AUTO_RISK_MIN_LOOKBACK_DAYS = 365
+AUTO_RISK_MIN_TRADES = 12
+AUTO_RISK_STOP_LOSS_QUANTILE = 0.80
+AUTO_RISK_PROFIT_TRIGGER_QUANTILE = 0.65
+AUTO_RISK_TRAILING_RATIO = 0.50
+AUTO_RISK_MIN_POINTS = 5.0
+
 # ============================================================
 # 1. 頁面初始化設定與 Shioaji 連線
 # ============================================================
@@ -638,13 +645,43 @@ with st.sidebar:
             )
             st.session_state["auto_backtest_period"] = auto_backtest_period
 
+            st.markdown("**🛡️ 自動風控參數（由回測分佈推導）**")
+            stop_loss_quantile = st.slider(
+                "最大虧損分位（停損）",
+                min_value=0.50,
+                max_value=0.95,
+                value=float(st.session_state.get("risk_stop_loss_quantile", AUTO_RISK_STOP_LOSS_QUANTILE)),
+                step=0.01,
+                help="用歷史 max_loss_points 的分位數推導停損點數。",
+            )
+            profit_trigger_quantile = st.slider(
+                "最大獲利分位（啟動動態停利）",
+                min_value=0.50,
+                max_value=0.95,
+                value=float(st.session_state.get("risk_profit_trigger_quantile", AUTO_RISK_PROFIT_TRIGGER_QUANTILE)),
+                step=0.01,
+                help="用歷史 max_profit_points 的分位數推導啟動門檻。",
+            )
+            trailing_ratio = st.slider(
+                "動態停利回撤比例（相對停損）",
+                min_value=0.20,
+                max_value=1.00,
+                value=float(st.session_state.get("risk_trailing_ratio", AUTO_RISK_TRAILING_RATIO)),
+                step=0.05,
+                help="回撤門檻 = 停損點數 × 此比例。",
+            )
+            st.session_state["risk_stop_loss_quantile"] = float(stop_loss_quantile)
+            st.session_state["risk_profit_trigger_quantile"] = float(profit_trigger_quantile)
+            st.session_state["risk_trailing_ratio"] = float(trailing_ratio)
+
             st.info(
                 "📌 **策略：MA60/MA100 撐壓進場**\n\n"
                 "• **關鍵K**：第N根以 buffer 判斷觸及 MA60 或 MA100\n"
                 "• **多方吞噬**：第N+1根 Close > 第N根 max(Open, Close)\n"
                 "• **空方吞噬**：第N+1根 Close < 第N根 min(Open, Close)\n"
                 "• **方向過濾**：多方需 MA60 斜率向上；空方需 MA60 斜率向下\n"
-                "• **限制**：跨日不計，收盤前30分鐘不開新倉"
+                "• **限制**：跨日不計，收盤前30分鐘不開新倉\n"
+                f"• **風控參數**：停損分位={stop_loss_quantile:.2f}、獲利分位={profit_trigger_quantile:.2f}、回撤比例={trailing_ratio:.2f}"
             )
 
     # 顯示提示訊息
@@ -2134,6 +2171,46 @@ def _plot_trade_window_for_export(
     return fig
 
 
+def _calculate_performance_metrics(trades: list[dict]) -> dict:
+    """計算策略報告核心指標。"""
+    total_trades = len(trades)
+    pnl_list = [float(t.get("pnl", 0) or 0) for t in trades]
+    total_pnl = float(sum(pnl_list)) if total_trades > 0 else 0.0
+
+    win_trades = int(sum(1 for pnl in pnl_list if pnl > 0)) if total_trades > 0 else 0
+    loss_trades = int(sum(1 for pnl in pnl_list if pnl < 0)) if total_trades > 0 else 0
+    win_rate = (win_trades / total_trades * 100.0) if total_trades > 0 else 0.0
+
+    gross_profit = float(sum(pnl for pnl in pnl_list if pnl > 0)) if total_trades > 0 else 0.0
+    gross_loss_abs = float(abs(sum(pnl for pnl in pnl_list if pnl < 0))) if total_trades > 0 else 0.0
+    if gross_loss_abs > 0:
+        profit_factor = gross_profit / gross_loss_abs
+    elif gross_profit > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = 0.0
+
+    equity_curve = pd.Series(pnl_list, dtype="float64").cumsum() if total_trades > 0 else pd.Series([], dtype="float64")
+    if equity_curve.empty:
+        max_drawdown = 0.0
+    else:
+        running_peak = equity_curve.cummax()
+        drawdowns = running_peak - equity_curve
+        max_drawdown = float(drawdowns.max())
+
+    return {
+        "total_trades": total_trades,
+        "total_pnl": float(total_pnl),
+        "win_trades": win_trades,
+        "loss_trades": loss_trades,
+        "win_rate": float(win_rate),
+        "gross_profit": float(gross_profit),
+        "gross_loss_abs": float(gross_loss_abs),
+        "profit_factor": float(profit_factor),
+        "max_drawdown": float(max_drawdown),
+    }
+
+
 def export_backtest_results_to_folder(
     bt_trades,
     interval: str,
@@ -2182,11 +2259,7 @@ def export_backtest_results_to_folder(
     trade_csv_path = os.path.join(out_dir, "trades.csv")
     trades_df.to_csv(trade_csv_path, index=False, encoding="utf-8-sig")
 
-    total_trades = len(bt_trades)
-    total_pnl = float(sum(t.get("pnl", 0) for t in bt_trades)) if total_trades > 0 else 0.0
-    win_trades = int(sum(1 for t in bt_trades if float(t.get("pnl", 0)) > 0)) if total_trades > 0 else 0
-    loss_trades = int(sum(1 for t in bt_trades if float(t.get("pnl", 0)) < 0)) if total_trades > 0 else 0
-    win_rate = (win_trades / total_trades * 100.0) if total_trades > 0 else 0.0
+    metrics = _calculate_performance_metrics(bt_trades)
 
     summary_df = pd.DataFrame(
         [
@@ -2196,11 +2269,13 @@ def export_backtest_results_to_folder(
                 "session": session,
                 "interval": interval,
                 "period": period_label,
-                "total_trades": total_trades,
-                "win_trades": win_trades,
-                "loss_trades": loss_trades,
-                "win_rate": round(win_rate, 2),
-                "total_pnl": round(total_pnl, 2),
+                "total_trades": metrics["total_trades"],
+                "win_trades": metrics["win_trades"],
+                "loss_trades": metrics["loss_trades"],
+                "win_rate": round(metrics["win_rate"], 2),
+                "total_pnl": round(metrics["total_pnl"], 2),
+                "max_drawdown": round(metrics["max_drawdown"], 2),
+                "profit_factor": round(metrics["profit_factor"], 4) if math.isfinite(metrics["profit_factor"]) else "inf",
             }
         ]
     )
@@ -2603,7 +2678,72 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
     return trades, add_events
 
 
-def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="日盤", is_realtime=False):
+def _select_recent_df_by_days(df: pd.DataFrame, days: int = AUTO_RISK_MIN_LOOKBACK_DAYS) -> pd.DataFrame:
+    """取最近 N 天資料做風控參數校準。"""
+    if df is None or df.empty:
+        return df
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    end_ts = df.index.max()
+    start_ts = end_ts - pd.Timedelta(days=days)
+    return df[df.index >= start_ts]
+
+
+def _derive_auto_risk_params_from_trades(
+    trades: list[dict],
+    stop_loss_quantile: float = AUTO_RISK_STOP_LOSS_QUANTILE,
+    profit_trigger_quantile: float = AUTO_RISK_PROFIT_TRIGGER_QUANTILE,
+    trailing_ratio: float = AUTO_RISK_TRAILING_RATIO,
+):
+    """由歷史交易的最大虧損/最大獲利分佈，推導停損與動態停利參數。"""
+    if not trades:
+        return None
+
+    losses = []
+    profits = []
+    for trade in trades:
+        loss_points = float(trade.get("max_loss_points", 0.0) or 0.0)
+        profit_points = float(trade.get("max_profit_points", 0.0) or 0.0)
+        if loss_points > 0:
+            losses.append(loss_points)
+        if profit_points > 0:
+            profits.append(profit_points)
+
+    if len(losses) < AUTO_RISK_MIN_TRADES or len(profits) < AUTO_RISK_MIN_TRADES:
+        return None
+
+    loss_series = pd.Series(losses)
+    profit_series = pd.Series(profits)
+
+    stop_loss_points = float(loss_series.quantile(stop_loss_quantile))
+    profit_trigger_points = float(profit_series.quantile(profit_trigger_quantile))
+
+    stop_loss_points = max(AUTO_RISK_MIN_POINTS, stop_loss_points)
+    profit_trigger_points = max(stop_loss_points * 0.8, AUTO_RISK_MIN_POINTS, profit_trigger_points)
+    trailing_gap_points = max(AUTO_RISK_MIN_POINTS, stop_loss_points * trailing_ratio)
+
+    return {
+        "stop_loss_points": round(stop_loss_points, 2),
+        "profit_trigger_points": round(profit_trigger_points, 2),
+        "trailing_gap_points": round(trailing_gap_points, 2),
+        "stop_loss_quantile": round(float(stop_loss_quantile), 2),
+        "profit_trigger_quantile": round(float(profit_trigger_quantile), 2),
+        "trailing_ratio": round(float(trailing_ratio), 2),
+        "sample_trades": min(len(losses), len(profits)),
+    }
+
+
+def calculate_ma60_ma100_support_resistance_signals(
+    df,
+    min_bars=105,
+    session="日盤",
+    is_realtime=False,
+    auto_risk=True,
+    risk_params=None,
+    risk_config=None,
+    _calibration_mode=False,
+):
     """
     策略：MA60/MA100 撐壓進場
 
@@ -2622,6 +2762,36 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
     trades = []
     add_events = []
 
+    active_risk_params = risk_params
+    config = risk_config or {}
+    stop_loss_quantile_cfg = float(config.get("stop_loss_quantile", AUTO_RISK_STOP_LOSS_QUANTILE))
+    profit_trigger_quantile_cfg = float(config.get("profit_trigger_quantile", AUTO_RISK_PROFIT_TRIGGER_QUANTILE))
+    trailing_ratio_cfg = float(config.get("trailing_ratio", AUTO_RISK_TRAILING_RATIO))
+    if auto_risk and (not _calibration_mode) and active_risk_params is None:
+        calibrate_df = _select_recent_df_by_days(df, AUTO_RISK_MIN_LOOKBACK_DAYS)
+        if calibrate_df is not None and len(calibrate_df) >= min_bars:
+            base_trades, _ = calculate_ma60_ma100_support_resistance_signals(
+                calibrate_df,
+                min_bars=min_bars,
+                session=session,
+                is_realtime=False,
+                auto_risk=False,
+                risk_params=None,
+                risk_config=risk_config,
+                _calibration_mode=True,
+            )
+            active_risk_params = _derive_auto_risk_params_from_trades(
+                base_trades,
+                stop_loss_quantile=stop_loss_quantile_cfg,
+                profit_trigger_quantile=profit_trigger_quantile_cfg,
+                trailing_ratio=trailing_ratio_cfg,
+            )
+            if active_risk_params is not None:
+                add_events.append({
+                    "type": "auto_risk_params",
+                    **active_risk_params,
+                })
+
     if "MA60" not in df.columns:
         df["MA60"] = df["Close"].rolling(window=60).mean()
     if "MA100" not in df.columns:
@@ -2630,10 +2800,16 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
 
     position = None
     buffer_points = 10.0
+    stop_loss_limit = float((active_risk_params or {}).get("stop_loss_points", 0.0) or 0.0)
+    profit_trigger_limit = float((active_risk_params or {}).get("profit_trigger_points", 0.0) or 0.0)
+    trailing_gap_limit = float((active_risk_params or {}).get("trailing_gap_points", 0.0) or 0.0)
+    use_dynamic_risk = stop_loss_limit > 0 and profit_trigger_limit > 0 and trailing_gap_limit > 0
 
     entry_idx = None
     entry_price = None
     bars_in_position = 0
+    best_profit_points = 0.0
+    trailing_armed = False
 
     def _compute_trade_excursions(start_idx, end_idx, direction, base_entry_price):
         """計算單筆交易期間最大虧損/最大獲利（點）。"""
@@ -2729,6 +2905,8 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
                 entry_idx = i
                 entry_price = row_curr["Close"]
                 bars_in_position = 1
+                best_profit_points = 0.0
+                trailing_armed = False
             elif (
                 key_close_short_valid
                 and ma60_down
@@ -2740,9 +2918,85 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
                 entry_idx = i
                 entry_price = row_curr["Close"]
                 bars_in_position = 1
+                best_profit_points = 0.0
+                trailing_armed = False
             continue
 
         bars_in_position += 1
+
+        current_high = float(row_curr["High"])
+        current_low = float(row_curr["Low"])
+
+        if position == "LONG":
+            current_adverse_points = max(0.0, float(entry_price) - current_low)
+            current_profit_points = max(0.0, current_high - float(entry_price))
+        else:
+            current_adverse_points = max(0.0, current_high - float(entry_price))
+            current_profit_points = max(0.0, float(entry_price) - current_low)
+
+        best_profit_points = max(best_profit_points, current_profit_points)
+
+        if use_dynamic_risk:
+            if current_adverse_points >= stop_loss_limit:
+                exit_idx = i
+                if position == "LONG":
+                    exit_price = float(entry_price) - stop_loss_limit
+                else:
+                    exit_price = float(entry_price) + stop_loss_limit
+                max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
+                trades.append({
+                    "entry_idx": entry_idx,
+                    "entry_ts": df.index[entry_idx],
+                    "entry_price": entry_price,
+                    "exit_idx": exit_idx,
+                    "exit_ts": df.index[exit_idx],
+                    "exit_price": exit_price,
+                    "direction": position,
+                    "bars_held": bars_in_position,
+                    "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+                    "max_loss_points": max_loss_points,
+                    "max_profit_points": max_profit_points,
+                    "exit_reason": f"動態風控停損({stop_loss_limit:.1f}點)",
+                })
+                position = None
+                entry_idx = None
+                entry_price = None
+                bars_in_position = 0
+                best_profit_points = 0.0
+                trailing_armed = False
+                continue
+
+            if (not trailing_armed) and best_profit_points >= profit_trigger_limit:
+                trailing_armed = True
+
+            if trailing_armed and (best_profit_points - current_profit_points) >= trailing_gap_limit:
+                exit_idx = i
+                if position == "LONG":
+                    exit_price = float(entry_price) + max(0.0, best_profit_points - trailing_gap_limit)
+                else:
+                    exit_price = float(entry_price) - max(0.0, best_profit_points - trailing_gap_limit)
+                max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
+                trades.append({
+                    "entry_idx": entry_idx,
+                    "entry_ts": df.index[entry_idx],
+                    "entry_price": entry_price,
+                    "exit_idx": exit_idx,
+                    "exit_ts": df.index[exit_idx],
+                    "exit_price": exit_price,
+                    "direction": position,
+                    "bars_held": bars_in_position,
+                    "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+                    "max_loss_points": max_loss_points,
+                    "max_profit_points": max_profit_points,
+                    "exit_reason": f"動態停利回撤({trailing_gap_limit:.1f}點)",
+                })
+                position = None
+                entry_idx = None
+                entry_price = None
+                bars_in_position = 0
+                best_profit_points = 0.0
+                trailing_armed = False
+                continue
 
         if cutoff_reached:
             exit_idx = i
@@ -2766,6 +3020,8 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
             entry_idx = None
             entry_price = None
             bars_in_position = 0
+            best_profit_points = 0.0
+            trailing_armed = False
             continue
 
         prev_body_low = min(row_prev["Open"], row_prev["Close"])
@@ -2796,6 +3052,8 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
             entry_idx = None
             entry_price = None
             bars_in_position = 0
+            best_profit_points = 0.0
+            trailing_armed = False
             continue
 
         if position == "SHORT" and row_curr["Close"] > prev_body_high:
@@ -2820,6 +3078,8 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
             entry_idx = None
             entry_price = None
             bars_in_position = 0
+            best_profit_points = 0.0
+            trailing_armed = False
             continue
 
     if (not is_realtime) and position is not None and entry_idx is not None:
@@ -2844,7 +3104,7 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
     return trades, add_events
 
 
-def run_selected_strategy(df, session="日盤", is_realtime=False, strategies=None):
+def run_selected_strategy(df, session="日盤", is_realtime=False, strategies=None, risk_config=None):
     """執行單一或多個策略（可擴充多策略組合）。"""
     strategy_dispatch = {
         "ma60_ma100_sr_entry": {
@@ -2868,7 +3128,12 @@ def run_selected_strategy(df, session="日盤", is_realtime=False, strategies=No
         strategy_func = strategy_info["func"]
         strategy_name = strategy_info["name"]
 
-        trades, add_events = strategy_func(df, session=session, is_realtime=is_realtime)
+        trades, add_events = strategy_func(
+            df,
+            session=session,
+            is_realtime=is_realtime,
+            risk_config=risk_config,
+        )
         for trade in trades:
             trade_copy = dict(trade)
             trade_copy["strategy_key"] = strategy_key
@@ -3170,6 +3435,12 @@ if df is not None:
 # 5. 繪製互動式 K 線圖 (Visualization)
 # ============================================================
 if df is not None:
+    risk_config = {
+        "stop_loss_quantile": float(st.session_state.get("risk_stop_loss_quantile", AUTO_RISK_STOP_LOSS_QUANTILE)),
+        "profit_trigger_quantile": float(st.session_state.get("risk_profit_trigger_quantile", AUTO_RISK_PROFIT_TRIGGER_QUANTILE)),
+        "trailing_ratio": float(st.session_state.get("risk_trailing_ratio", AUTO_RISK_TRAILING_RATIO)),
+    }
+
     # ------------------------------------------------------------
     # 5.0 建立連續的 x 軸索引（移除所有空白間隙）
     # ------------------------------------------------------------
@@ -3276,7 +3547,12 @@ if df is not None:
     # 5.3.1 繪製策略信號標記
     # ============================================================
     if st.session_state.get("enable_strategy", False):
-        trades, add_events = run_selected_strategy(df, session=session_option, is_realtime=is_realtime)
+        trades, add_events = run_selected_strategy(
+            df,
+            session=session_option,
+            is_realtime=is_realtime,
+            risk_config=risk_config,
+        )
         
         if trades:
             marker_offset = 30.0
@@ -3468,6 +3744,7 @@ if df is not None:
             session=session_option,
             is_realtime=is_realtime,
             strategies=selected_strategy_keys,
+            risk_config=risk_config,
         )
         
         if trades:
@@ -3485,40 +3762,35 @@ if df is not None:
                     trade_records.append({
                         "編號": i,
                         "進場時間": entry_time,
-                        "進場價": f"{trade['entry_price']:.0f}",
+                        "進場點": f"{trade['entry_price']:.0f}",
                         "退場時間": exit_time,
-                        "退場價": f"{trade['exit_price']:.0f}",
-                        "方向": trade["direction"],
-                        "持倉K棒數": trade["bars_held"],
-                        "最大虧損": f"-{float(trade.get('max_loss_points', 0)):.0f}",
-                        "最大獲利": f"+{float(trade.get('max_profit_points', 0)):.0f}",
+                        "退場點": f"{trade['exit_price']:.0f}",
+                        "持倉K": trade["bars_held"],
+                        "最大不利點": f"-{float(trade.get('max_loss_points', 0)):.0f}",
+                        "最大有利點": f"+{float(trade.get('max_profit_points', 0)):.0f}",
                         "退場原因": trade.get("exit_reason", ""),
-                        "損益": f"{trade['pnl']:+.0f}"
+                        "損益點": f"{trade['pnl']:+.0f}"
                     })
                 
                 trades_df = pd.DataFrame(trade_records)
                 st.dataframe(trades_df, use_container_width=True, hide_index=True)
                 
                 # 統計信息
-                total_trades = len(trades)
-                long_trades = sum(1 for t in trades if t["direction"] == "LONG")
-                short_trades = sum(1 for t in trades if t["direction"] == "SHORT")
-                total_pnl = sum(t["pnl"] for t in trades)
-
-                win_trades = sum(1 for t in trades if t["pnl"] > 0)
-                loss_trades = sum(1 for t in trades if t["pnl"] < 0)
-                win_rate = (win_trades / total_trades * 100) if total_trades > 0 else 0.0
+                metrics = _calculate_performance_metrics(trades)
+                total_trades = metrics["total_trades"]
+                total_pnl = metrics["total_pnl"]
+                win_rate = metrics["win_rate"]
+                max_drawdown = metrics["max_drawdown"]
+                profit_factor = metrics["profit_factor"]
                 
                 col_stats1, col_stats2, col_stats3, col_stats4 = st.columns(4)
                 col_stats1.metric("總交易數", total_trades)
-                col_stats2.metric("做多", long_trades)
-                col_stats3.metric("做空", short_trades)
-                col_stats4.metric("總損益", f"{total_pnl:+.0f}")
+                col_stats2.metric("總損益", f"{total_pnl:+.0f}")
+                col_stats3.metric("勝率", f"{win_rate:.1f}%")
+                col_stats4.metric("獲利因子", f"{profit_factor:.2f}" if math.isfinite(profit_factor) else "∞")
 
-                col_stats5, col_stats6, col_stats7 = st.columns(3)
-                col_stats5.metric("獲利筆數", win_trades)
-                col_stats6.metric("虧損筆數", loss_trades)
-                col_stats7.metric("勝率", f"{win_rate:.1f}%")
+                col_stats5 = st.columns(1)[0]
+                col_stats5.metric("最大資產回撤", f"-{max_drawdown:.0f}")
 
                 export_trades_key = (
                     f"export_trades_{interval_option}_{session_option}_{'+'.join(selected_strategy_keys)}"
@@ -3562,13 +3834,15 @@ if df is not None:
                     session=session_option,
                     is_realtime=False,
                     strategies=selected_strategy_keys,
+                    risk_config=risk_config,
                 )
 
-                bt_total = len(bt_trades)
-                bt_total_pnl = float(sum(t.get("pnl", 0) for t in bt_trades)) if bt_total > 0 else 0.0
-                bt_win = int(sum(1 for t in bt_trades if float(t.get("pnl", 0)) > 0)) if bt_total > 0 else 0
-                bt_loss = int(sum(1 for t in bt_trades if float(t.get("pnl", 0)) < 0)) if bt_total > 0 else 0
-                bt_win_rate = (bt_win / bt_total * 100.0) if bt_total > 0 else 0.0
+                bt_metrics = _calculate_performance_metrics(bt_trades)
+                bt_total = bt_metrics["total_trades"]
+                bt_total_pnl = bt_metrics["total_pnl"]
+                bt_win_rate = bt_metrics["win_rate"]
+                bt_max_drawdown = bt_metrics["max_drawdown"]
+                bt_profit_factor = bt_metrics["profit_factor"]
 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("回測筆數", bt_total)
@@ -3577,8 +3851,57 @@ if df is not None:
                 c4.metric("資料範圍", f"{period_days} 天")
 
                 c5, c6 = st.columns(2)
-                c5.metric("獲利筆數", bt_win)
-                c6.metric("虧損筆數", bt_loss)
+                c5.metric("最大資產回撤", f"-{bt_max_drawdown:.0f}")
+                c6.metric("獲利因子", f"{bt_profit_factor:.2f}" if math.isfinite(bt_profit_factor) else "∞")
+
+                def _build_compare_stats(days_count: int):
+                    comp_raw = get_backtest_data_from_db(interval_option, session_option, days_count)
+                    comp_df = process_kline_data(comp_raw, interval_option, session_option)
+                    if comp_df is None or comp_df.empty:
+                        return {
+                            "期間": f"{days_count}天",
+                            "交易數": 0,
+                            "勝率(%)": 0.0,
+                            "總損益": 0.0,
+                            "最大資產回撤": 0.0,
+                            "獲利因子": 0.0,
+                            "平均每筆": 0.0,
+                        }
+
+                    comp_trades, _ = run_selected_strategy(
+                        comp_df,
+                        session=session_option,
+                        is_realtime=False,
+                        strategies=selected_strategy_keys,
+                        risk_config=risk_config,
+                    )
+                    comp_metrics = _calculate_performance_metrics(comp_trades)
+                    trade_count = comp_metrics["total_trades"]
+                    total_pnl = comp_metrics["total_pnl"]
+                    win_rate = comp_metrics["win_rate"]
+                    avg_pnl = (total_pnl / trade_count) if trade_count > 0 else 0.0
+
+                    return {
+                        "期間": f"{days_count}天",
+                        "交易數": trade_count,
+                        "勝率(%)": round(win_rate, 2),
+                        "總損益": round(total_pnl, 2),
+                        "最大資產回撤": round(comp_metrics["max_drawdown"], 2),
+                        "獲利因子": round(comp_metrics["profit_factor"], 4) if math.isfinite(comp_metrics["profit_factor"]) else "inf",
+                        "平均每筆": round(avg_pnl, 2),
+                    }
+
+                compare_1y = _build_compare_stats(365)
+                compare_2y = _build_compare_stats(730)
+                compare_df = pd.DataFrame([compare_1y, compare_2y])
+                st.markdown("#### 📊 1年 vs 2年 對照回測")
+                st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
+                delta_pnl = float(compare_2y["總損益"]) - float(compare_1y["總損益"])
+                delta_win_rate = float(compare_2y["勝率(%)"]) - float(compare_1y["勝率(%)"])
+                d1, d2 = st.columns(2)
+                d1.metric("2年-1年 總損益差", f"{delta_pnl:+.0f}")
+                d2.metric("2年-1年 勝率差", f"{delta_win_rate:+.2f}%")
 
                 if bt_total > 0:
                     bt_records = []
@@ -3589,12 +3912,11 @@ if df is not None:
                             {
                                 "序": i,
                                 "策略": trade.get("strategy_name", ""),
-                                "方向": trade.get("direction", ""),
                                 "進場": entry_ts.strftime('%m-%d %H:%M') if hasattr(entry_ts, 'strftime') else str(entry_ts),
                                 "退場": exit_ts.strftime('%m-%d %H:%M') if hasattr(exit_ts, 'strftime') else str(exit_ts),
-                                "最大虧損": f"-{float(trade.get('max_loss_points', 0)):.0f}",
-                                "最大獲利": f"+{float(trade.get('max_profit_points', 0)):.0f}",
-                                "損益": f"{float(trade.get('pnl', 0)):+.0f}",
+                                "最大不利點": f"-{float(trade.get('max_loss_points', 0)):.0f}",
+                                "最大有利點": f"+{float(trade.get('max_profit_points', 0)):.0f}",
+                                "損益點": f"{float(trade.get('pnl', 0)):+.0f}",
                             }
                         )
                     st.dataframe(pd.DataFrame(bt_records), use_container_width=True, hide_index=True)

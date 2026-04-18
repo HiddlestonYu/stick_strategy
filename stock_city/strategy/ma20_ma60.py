@@ -4,6 +4,12 @@ import pandas as pd
 
 
 STRATEGY_MA60_MA100_SR_ENTRY = "ma60_ma100_sr_entry"
+AUTO_RISK_MIN_LOOKBACK_DAYS = 365
+AUTO_RISK_MIN_TRADES = 12
+AUTO_RISK_STOP_LOSS_QUANTILE = 0.80
+AUTO_RISK_PROFIT_TRIGGER_QUANTILE = 0.65
+AUTO_RISK_TRAILING_RATIO = 0.50
+AUTO_RISK_MIN_POINTS = 5.0
 
 
 def get_strategy_registry():
@@ -43,6 +49,54 @@ def _normalize_strategy_keys(strategy):
             normalized.append(mapped)
 
     return normalized or [STRATEGY_MA60_MA100_SR_ENTRY]
+
+
+def _select_recent_df_by_days(df: pd.DataFrame, days: int = AUTO_RISK_MIN_LOOKBACK_DAYS) -> pd.DataFrame:
+    """取最近 N 天資料做風控參數校準。"""
+    if df is None or df.empty:
+        return df
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    end_ts = df.index.max()
+    start_ts = end_ts - pd.Timedelta(days=days)
+    return df[df.index >= start_ts]
+
+
+def _derive_auto_risk_params_from_trades(trades: list[dict]):
+    """由歷史交易的最大虧損/最大獲利分佈，推導停損與動態停利參數。"""
+    if not trades:
+        return None
+
+    losses = []
+    profits = []
+    for trade in trades:
+        loss_points = float(trade.get("max_loss_points", 0.0) or 0.0)
+        profit_points = float(trade.get("max_profit_points", 0.0) or 0.0)
+        if loss_points > 0:
+            losses.append(loss_points)
+        if profit_points > 0:
+            profits.append(profit_points)
+
+    if len(losses) < AUTO_RISK_MIN_TRADES or len(profits) < AUTO_RISK_MIN_TRADES:
+        return None
+
+    loss_series = pd.Series(losses)
+    profit_series = pd.Series(profits)
+
+    stop_loss_points = float(loss_series.quantile(AUTO_RISK_STOP_LOSS_QUANTILE))
+    profit_trigger_points = float(profit_series.quantile(AUTO_RISK_PROFIT_TRIGGER_QUANTILE))
+
+    stop_loss_points = max(AUTO_RISK_MIN_POINTS, stop_loss_points)
+    profit_trigger_points = max(stop_loss_points * 0.8, AUTO_RISK_MIN_POINTS, profit_trigger_points)
+    trailing_gap_points = max(AUTO_RISK_MIN_POINTS, stop_loss_points * AUTO_RISK_TRAILING_RATIO)
+
+    return {
+        "stop_loss_points": round(stop_loss_points, 2),
+        "profit_trigger_points": round(profit_trigger_points, 2),
+        "trailing_gap_points": round(trailing_gap_points, 2),
+        "sample_trades": min(len(losses), len(profits)),
+    }
 
 
 def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_realtime=False):
@@ -330,7 +384,15 @@ def calculate_ma_trend_engulfing_signals(df, min_bars=25, session="日盤", is_r
     return trades, add_events
 
 
-def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="日盤", is_realtime=False):
+def calculate_ma60_ma100_support_resistance_signals(
+    df,
+    min_bars=105,
+    session="日盤",
+    is_realtime=False,
+    auto_risk=True,
+    risk_params=None,
+    _calibration_mode=False,
+):
     """
     策略：MA60/MA100 撐壓進場。
 
@@ -349,6 +411,26 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
     trades = []
     add_events = []
 
+    active_risk_params = risk_params
+    if auto_risk and (not _calibration_mode) and active_risk_params is None:
+        calibrate_df = _select_recent_df_by_days(df, AUTO_RISK_MIN_LOOKBACK_DAYS)
+        if calibrate_df is not None and len(calibrate_df) >= min_bars:
+            base_trades, _ = calculate_ma60_ma100_support_resistance_signals(
+                calibrate_df,
+                min_bars=min_bars,
+                session=session,
+                is_realtime=False,
+                auto_risk=False,
+                risk_params=None,
+                _calibration_mode=True,
+            )
+            active_risk_params = _derive_auto_risk_params_from_trades(base_trades)
+            if active_risk_params is not None:
+                add_events.append({
+                    "type": "auto_risk_params",
+                    **active_risk_params,
+                })
+
     if "MA60" not in df.columns:
         df["MA60"] = df["Close"].rolling(window=60).mean()
     if "MA100" not in df.columns:
@@ -357,10 +439,16 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
 
     position = None
     buffer_points = 10.0
+    stop_loss_limit = float((active_risk_params or {}).get("stop_loss_points", 0.0) or 0.0)
+    profit_trigger_limit = float((active_risk_params or {}).get("profit_trigger_points", 0.0) or 0.0)
+    trailing_gap_limit = float((active_risk_params or {}).get("trailing_gap_points", 0.0) or 0.0)
+    use_dynamic_risk = stop_loss_limit > 0 and profit_trigger_limit > 0 and trailing_gap_limit > 0
 
     entry_idx = None
     entry_price = None
     bars_in_position = 0
+    best_profit_points = 0.0
+    trailing_armed = False
 
     def _compute_trade_excursions(start_idx, end_idx, direction, base_entry_price):
         """計算單筆交易期間最大虧損/最大獲利（點）。"""
@@ -456,6 +544,8 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
                 entry_idx = i
                 entry_price = row_curr["Close"]
                 bars_in_position = 1
+                best_profit_points = 0.0
+                trailing_armed = False
             elif (
                 key_close_short_valid
                 and ma60_down
@@ -467,9 +557,85 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
                 entry_idx = i
                 entry_price = row_curr["Close"]
                 bars_in_position = 1
+                best_profit_points = 0.0
+                trailing_armed = False
             continue
 
         bars_in_position += 1
+
+        current_high = float(row_curr["High"])
+        current_low = float(row_curr["Low"])
+
+        if position == "LONG":
+            current_adverse_points = max(0.0, float(entry_price) - current_low)
+            current_profit_points = max(0.0, current_high - float(entry_price))
+        else:
+            current_adverse_points = max(0.0, current_high - float(entry_price))
+            current_profit_points = max(0.0, float(entry_price) - current_low)
+
+        best_profit_points = max(best_profit_points, current_profit_points)
+
+        if use_dynamic_risk:
+            if current_adverse_points >= stop_loss_limit:
+                exit_idx = i
+                if position == "LONG":
+                    exit_price = float(entry_price) - stop_loss_limit
+                else:
+                    exit_price = float(entry_price) + stop_loss_limit
+                max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
+                trades.append({
+                    "entry_idx": entry_idx,
+                    "entry_ts": df.index[entry_idx],
+                    "entry_price": entry_price,
+                    "exit_idx": exit_idx,
+                    "exit_ts": df.index[exit_idx],
+                    "exit_price": exit_price,
+                    "direction": position,
+                    "bars_held": bars_in_position,
+                    "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+                    "max_loss_points": max_loss_points,
+                    "max_profit_points": max_profit_points,
+                    "exit_reason": f"動態風控停損({stop_loss_limit:.1f}點)",
+                })
+                position = None
+                entry_idx = None
+                entry_price = None
+                bars_in_position = 0
+                best_profit_points = 0.0
+                trailing_armed = False
+                continue
+
+            if (not trailing_armed) and best_profit_points >= profit_trigger_limit:
+                trailing_armed = True
+
+            if trailing_armed and (best_profit_points - current_profit_points) >= trailing_gap_limit:
+                exit_idx = i
+                if position == "LONG":
+                    exit_price = float(entry_price) + max(0.0, best_profit_points - trailing_gap_limit)
+                else:
+                    exit_price = float(entry_price) - max(0.0, best_profit_points - trailing_gap_limit)
+                max_loss_points, max_profit_points = _compute_trade_excursions(entry_idx, exit_idx, position, entry_price)
+                trades.append({
+                    "entry_idx": entry_idx,
+                    "entry_ts": df.index[entry_idx],
+                    "entry_price": entry_price,
+                    "exit_idx": exit_idx,
+                    "exit_ts": df.index[exit_idx],
+                    "exit_price": exit_price,
+                    "direction": position,
+                    "bars_held": bars_in_position,
+                    "pnl": (exit_price - entry_price) if position == "LONG" else (entry_price - exit_price),
+                    "max_loss_points": max_loss_points,
+                    "max_profit_points": max_profit_points,
+                    "exit_reason": f"動態停利回撤({trailing_gap_limit:.1f}點)",
+                })
+                position = None
+                entry_idx = None
+                entry_price = None
+                bars_in_position = 0
+                best_profit_points = 0.0
+                trailing_armed = False
+                continue
 
         if cutoff_reached:
             exit_idx = i
@@ -493,6 +659,8 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
             entry_idx = None
             entry_price = None
             bars_in_position = 0
+            best_profit_points = 0.0
+            trailing_armed = False
             continue
 
         prev_body_low = min(row_prev["Open"], row_prev["Close"])
@@ -523,6 +691,8 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
             entry_idx = None
             entry_price = None
             bars_in_position = 0
+            best_profit_points = 0.0
+            trailing_armed = False
             continue
 
         if position == "SHORT" and row_curr["Close"] > prev_body_high:
@@ -547,6 +717,8 @@ def calculate_ma60_ma100_support_resistance_signals(df, min_bars=105, session="�
             entry_idx = None
             entry_price = None
             bars_in_position = 0
+            best_profit_points = 0.0
+            trailing_armed = False
             continue
 
     if (not is_realtime) and position is not None and entry_idx is not None:
