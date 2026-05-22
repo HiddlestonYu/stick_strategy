@@ -7,3 +7,5 @@ pathlib>=1.0.1
 streamlit>=1.28.0
 plotly>=5.17.0
 holidays>=0.40
+PyQt5>=5.15.11
+pyqtgraph>=0.13.7

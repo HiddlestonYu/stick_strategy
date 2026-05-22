@@ -63,7 +63,12 @@ def _select_recent_df_by_days(df: pd.DataFrame, days: int = AUTO_RISK_MIN_LOOKBA
     return df[df.index >= start_ts]
 
 
-def _derive_auto_risk_params_from_trades(trades: list[dict]):
+def _derive_auto_risk_params_from_trades(
+    trades: list[dict],
+    stop_loss_quantile: float = AUTO_RISK_STOP_LOSS_QUANTILE,
+    profit_trigger_quantile: float = AUTO_RISK_PROFIT_TRIGGER_QUANTILE,
+    trailing_ratio: float = AUTO_RISK_TRAILING_RATIO,
+):
     """由歷史交易的最大虧損/最大獲利分佈，推導停損與動態停利參數。"""
     if not trades:
         return None
@@ -84,17 +89,20 @@ def _derive_auto_risk_params_from_trades(trades: list[dict]):
     loss_series = pd.Series(losses)
     profit_series = pd.Series(profits)
 
-    stop_loss_points = float(loss_series.quantile(AUTO_RISK_STOP_LOSS_QUANTILE))
-    profit_trigger_points = float(profit_series.quantile(AUTO_RISK_PROFIT_TRIGGER_QUANTILE))
+    stop_loss_points = float(loss_series.quantile(stop_loss_quantile))
+    profit_trigger_points = float(profit_series.quantile(profit_trigger_quantile))
 
     stop_loss_points = max(AUTO_RISK_MIN_POINTS, stop_loss_points)
     profit_trigger_points = max(stop_loss_points * 0.8, AUTO_RISK_MIN_POINTS, profit_trigger_points)
-    trailing_gap_points = max(AUTO_RISK_MIN_POINTS, stop_loss_points * AUTO_RISK_TRAILING_RATIO)
+    trailing_gap_points = max(AUTO_RISK_MIN_POINTS, stop_loss_points * trailing_ratio)
 
     return {
         "stop_loss_points": round(stop_loss_points, 2),
         "profit_trigger_points": round(profit_trigger_points, 2),
         "trailing_gap_points": round(trailing_gap_points, 2),
+        "stop_loss_quantile": round(float(stop_loss_quantile), 2),
+        "profit_trigger_quantile": round(float(profit_trigger_quantile), 2),
+        "trailing_ratio": round(float(trailing_ratio), 2),
         "sample_trades": min(len(losses), len(profits)),
     }
 
@@ -391,6 +399,7 @@ def calculate_ma60_ma100_support_resistance_signals(
     is_realtime=False,
     auto_risk=True,
     risk_params=None,
+    risk_config=None,
     _calibration_mode=False,
 ):
     """
@@ -412,6 +421,10 @@ def calculate_ma60_ma100_support_resistance_signals(
     add_events = []
 
     active_risk_params = risk_params
+    config = risk_config or {}
+    stop_loss_quantile_cfg = float(config.get("stop_loss_quantile", AUTO_RISK_STOP_LOSS_QUANTILE))
+    profit_trigger_quantile_cfg = float(config.get("profit_trigger_quantile", AUTO_RISK_PROFIT_TRIGGER_QUANTILE))
+    trailing_ratio_cfg = float(config.get("trailing_ratio", AUTO_RISK_TRAILING_RATIO))
     if auto_risk and (not _calibration_mode) and active_risk_params is None:
         calibrate_df = _select_recent_df_by_days(df, AUTO_RISK_MIN_LOOKBACK_DAYS)
         if calibrate_df is not None and len(calibrate_df) >= min_bars:
@@ -422,9 +435,15 @@ def calculate_ma60_ma100_support_resistance_signals(
                 is_realtime=False,
                 auto_risk=False,
                 risk_params=None,
+                risk_config=risk_config,
                 _calibration_mode=True,
             )
-            active_risk_params = _derive_auto_risk_params_from_trades(base_trades)
+            active_risk_params = _derive_auto_risk_params_from_trades(
+                base_trades,
+                stop_loss_quantile=stop_loss_quantile_cfg,
+                profit_trigger_quantile=profit_trigger_quantile_cfg,
+                trailing_ratio=trailing_ratio_cfg,
+            )
             if active_risk_params is not None:
                 add_events.append({
                     "type": "auto_risk_params",
@@ -743,7 +762,7 @@ def calculate_ma60_ma100_support_resistance_signals(
     return trades, add_events
 
 
-def run_selected_strategy(df, strategy="strategy1", session="日盤", is_realtime=False):
+def run_selected_strategy(df, strategy="strategy1", session="日盤", is_realtime=False, risk_config=None):
     """執行單一或多個策略，回傳合併後交易訊號。"""
     registry = get_strategy_registry()
     selected_keys = _normalize_strategy_keys(strategy)
@@ -758,7 +777,12 @@ def run_selected_strategy(df, strategy="strategy1", session="日盤", is_realtim
 
         strategy_func = strategy_info["func"]
         strategy_name = strategy_info["name"]
-        trades, add_events = strategy_func(df, session=session, is_realtime=is_realtime)
+        trades, add_events = strategy_func(
+            df,
+            session=session,
+            is_realtime=is_realtime,
+            risk_config=risk_config,
+        )
 
         for trade in trades:
             trade_copy = dict(trade)
