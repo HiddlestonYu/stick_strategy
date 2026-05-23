@@ -493,3 +493,175 @@ def export_backtest_results_to_folder(bt_trades, interval, session, period_label
     summary_csv_path = os.path.join(out_dir, "summary.csv")
     summary_df.to_csv(summary_csv_path, index=False, encoding="utf-8-sig")
     return out_dir, trade_csv_path, summary_csv_path
+
+
+# ══════════════════ Tick 訂閱 ══════════════════
+
+def subscribe_realtime_tick(api, on_tick_callback):
+    """訂閱台指近月即時 Tick。on_tick_callback(dict) 在每筆 tick 呼叫。"""
+    if api is None:
+        return
+    try:
+        contract = api.Contracts.Futures.TXF.TXFR1
+
+        def _on_tick(exchange, tick):
+            try:
+                on_tick_callback({
+                    "close": float(getattr(tick, "close", 0)),
+                    "volume": int(getattr(tick, "volume", 0)),
+                    "tick_type": str(getattr(tick, "tick_type", "")),
+                })
+            except Exception:
+                pass
+
+        api.quote.subscribe(
+            contract,
+            quote_type=sj.constant.QuoteType.Tick,
+            version=sj.constant.QuoteVersion.v1,
+        )
+        api.quote.set_on_tick_fop_v1_callback(_on_tick)
+    except Exception:
+        pass
+
+
+def unsubscribe_realtime_tick(api):
+    """取消即時 Tick 訂閱。"""
+    if api is None:
+        return
+    try:
+        contract = api.Contracts.Futures.TXF.TXFR1
+        api.quote.unsubscribe(
+            contract,
+            quote_type=sj.constant.QuoteType.Tick,
+            version=sj.constant.QuoteVersion.v1,
+        )
+    except Exception:
+        pass
+
+
+# ══════════════════ 持倉 / 帳戶 ══════════════════
+
+def get_positions_and_balance(api):
+    """取得期貨持倉清單與帳戶餘額。"""
+    if api is None:
+        return {"positions": [], "balance": {}}
+    positions = []
+    try:
+        raw = api.list_positions(api.futopt_account)
+        for pos in (raw or []):
+            direction = (
+                "多"
+                if str(getattr(pos.direction, "name", "Buy")).startswith("Buy")
+                else "空"
+            )
+            positions.append({
+                "code": getattr(pos, "code", "-"),
+                "direction": direction,
+                "quantity": int(getattr(pos, "quantity", 0)),
+                "price": float(getattr(pos, "price", 0)),
+                "last_price": float(
+                    getattr(pos, "last_price", getattr(pos, "price", 0))
+                ),
+                "pnl": float(getattr(pos, "pnl", 0)),
+            })
+    except Exception:
+        pass
+    balance = {}
+    try:
+        acc = api.account_balance()
+        if acc is not None:
+            balance = {
+                "acc_balance": float(getattr(acc, "acc_balance", 0)),
+                "available_margin": float(getattr(acc, "available_margin", 0)),
+                "unrealized_pnl": float(getattr(acc, "unrealized_pnl", 0)),
+            }
+    except Exception:
+        pass
+    return {"positions": positions, "balance": balance}
+
+
+# ══════════════════ 下單 ══════════════════
+
+def place_futures_order(api, action: str, quantity: int, price=None) -> dict:
+    """下台指期貨單。action: 'Buy'/'Sell'，price=None 市價。"""
+    if api is None:
+        raise ValueError("尚未登入 Shioaji。")
+    contract = api.Contracts.Futures.TXF.TXFR1
+    act = sj.constant.Action.Buy if action == "Buy" else sj.constant.Action.Sell
+    action_label = "多單" if action == "Buy" else "空單"
+    if price is None:
+        order = sj.Order(
+            action=act,
+            price=0,
+            quantity=quantity,
+            order_type=sj.constant.OrderType.MKT,
+            price_type=sj.constant.FuturesPriceType.MKT,
+            octype=sj.constant.FuturesOCType.Auto,
+            account=api.futopt_account,
+        )
+        price_label = "市價"
+    else:
+        order = sj.Order(
+            action=act,
+            price=float(price),
+            quantity=quantity,
+            order_type=sj.constant.OrderType.ROD,
+            price_type=sj.constant.FuturesPriceType.LMT,
+            octype=sj.constant.FuturesOCType.Auto,
+            account=api.futopt_account,
+        )
+        price_label = f"限價 {float(price):.0f}"
+    trade = api.place_order(contract, order)
+    order_id = "-"
+    status = "submitted"
+    try:
+        order_id = (
+            trade.order.id
+            if hasattr(trade.order, "id")
+            else str(getattr(trade, "id", "-"))
+        )
+        status = str(getattr(trade.status, "status", "submitted"))
+    except Exception:
+        pass
+    return {
+        "order_id": order_id,
+        "status": status,
+        "msg": f"{action_label} {quantity}口 {price_label}　委託號：{order_id}",
+    }
+
+
+def close_all_positions(api) -> dict:
+    """一鍵平倉所有台指期倉位。"""
+    if api is None:
+        raise ValueError("尚未登入 Shioaji。")
+    result_data = get_positions_and_balance(api)
+    positions = result_data["positions"]
+    if not positions:
+        return {"status": "no_positions", "msg": "目前無持倉。", "order_id": "-"}
+    contract = api.Contracts.Futures.TXF.TXFR1
+    msgs = []
+    for pos in positions:
+        close_action = (
+            sj.constant.Action.Sell
+            if pos["direction"] == "多"
+            else sj.constant.Action.Buy
+        )
+        qty = int(pos["quantity"])
+        if qty <= 0:
+            continue
+        order = sj.Order(
+            action=close_action,
+            price=0,
+            quantity=qty,
+            order_type=sj.constant.OrderType.MKT,
+            price_type=sj.constant.FuturesPriceType.MKT,
+            octype=sj.constant.FuturesOCType.Auto,
+            account=api.futopt_account,
+        )
+        api.place_order(contract, order)
+        msgs.append(f"{pos['direction']} {qty}口平倉")
+    return {
+        "status": "submitted",
+        "msg": "平倉委託：" + "，".join(msgs) if msgs else "無需平倉",
+        "order_id": "-",
+    }
