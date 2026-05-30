@@ -20,6 +20,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_backtest_trades = []
         self._workers = []
         self._refresh_in_progress = False
+        self._manual_refresh = True
         self._strategy_worker = None
         self._last_price = None
         self._tick_bridge = TickSignalBridge()
@@ -75,6 +76,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_interval_spin.setValue(5)
         self.refresh_button = QtWidgets.QPushButton("重新載入")
         self.refresh_button.clicked.connect(self.refresh_data)
+        self.session_combo.currentTextChanged.connect(self._on_session_changed)
         data_form.addRow("K 線週期", self.interval_combo)
         data_form.addRow("時段", self.session_combo)
         data_form.addRow("顯示 K 棒數", self.kbars_spin)
@@ -206,8 +208,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         bottom_tabs = QtWidgets.QTabWidget()
         right_splitter.addWidget(bottom_tabs)
-        right_splitter.setStretchFactor(0, 3)
-        right_splitter.setStretchFactor(1, 2)
+        right_splitter.setStretchFactor(0, 4)
+        right_splitter.setStretchFactor(1, 1)
+        right_splitter.setSizes([800, 200])
 
         trade_tab = QtWidgets.QWidget()
         trade_layout = QtWidgets.QVBoxLayout(trade_tab)
@@ -291,6 +294,29 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_auto_refresh(self):
         self.refresh_data(silent=True)
 
+    def _on_session_changed(self, session_text):
+        if self.api is None:
+            return
+        if session_text != "夜盤":
+            return
+
+        # 先標記為手動刷新，確保後續圖表會重算 Y 軸（最高+100 / 最低-100）
+        self._manual_refresh = True
+
+        # 若已有資料，先立即重畫一次，讓使用者切換時就看到 Y 軸更新
+        if self.current_df is not None and not self.current_df.empty:
+            self.chart_widget.update_chart(
+                self.current_df, trades=self.current_trades, reset_view=True
+            )
+
+        # 若目前正在刷新，保留手動刷新旗標，待本輪完成後由策略更新路徑套用
+        if self._refresh_in_progress:
+            self.statusBar().showMessage("切換夜盤：目前更新中，完成後將自動重算 Y 軸", 2500)
+            return
+
+        self.statusBar().showMessage("切換夜盤，重新載入資料並重算 Y 軸", 2500)
+        self.refresh_data(silent=False)
+
     def open_login_dialog(self):
         dialog = LoginDialog(self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.api is not None:
@@ -307,6 +333,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._position_timer.start()
             self.refresh_positions()
             self.statusBar().showMessage("登入成功", 3000)
+            # 確保登入後必定重設 Y 軸（即使 refresh 被 in-progress 擋住也有效）
+            self._manual_refresh = True
+            if self.current_df is not None and not self.current_df.empty:
+                self.chart_widget.update_chart(
+                    self.current_df, trades=self.current_trades, reset_view=True
+                )
             self.refresh_data()
 
     def logout(self):
@@ -388,6 +420,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh_data(self, silent=False):
         if self._refresh_in_progress:
             return
+        self._manual_refresh = not silent
         self._refresh_in_progress = True
         self._set_busy(True)
         self._run_worker(
@@ -412,7 +445,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"DB 最新：{meta['last_db_ts']}　即時：{'是' if meta['is_realtime'] else '否'}"
         )
         self.statusBar().showMessage("資料已更新", 3000)
-        self.chart_widget.update_chart(self.current_df, trades=[])
+        self.chart_widget.update_chart(self.current_df, trades=[], reset_view=self._manual_refresh)
         self._update_strategy_views(meta["is_realtime"])
 
     def _update_strategy_views(self, is_realtime):
@@ -451,7 +484,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_trades = bundle["trades"]
         metrics_text = self._format_metrics_html("策略訊號統計", bundle["metrics"])
         self.export_current_button.setEnabled(bool(bundle["trades"]))
-        self.chart_widget.update_chart(self.current_df, trades=bundle["trades"])
+        self.chart_widget.update_chart(self.current_df, trades=bundle["trades"], reset_view=self._manual_refresh)
+        self._manual_refresh = False
         self.current_metrics_label.setText(metrics_text)
         self._set_table_dataframe(self.current_trade_table, bundle["trade_df"])
         self.statusBar().showMessage(f"策略計算完成，共 {len(bundle['trades'])} 筆交易", 3000)

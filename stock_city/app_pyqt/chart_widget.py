@@ -57,7 +57,7 @@ class StrategyChartWidget(QtWidgets.QWidget):
         self.graphics_layout = pg.GraphicsLayoutWidget()
         self.price_plot = self.graphics_layout.addPlot(row=0, col=0)
         self.volume_plot = self.graphics_layout.addPlot(row=1, col=0)
-        self.volume_plot.setMaximumHeight(180)
+        self.volume_plot.setMaximumHeight(100)
         self.volume_plot.setXLink(self.price_plot)
 
         self.price_plot.showGrid(x=True, y=True, alpha=0.2)
@@ -88,7 +88,18 @@ class StrategyChartWidget(QtWidgets.QWidget):
         self.price_plot.addItem(self._select_vline)
         self._select_vline.setVisible(False)
 
-    def update_chart(self, df, trades=None):
+    def update_chart(self, df, trades=None, reset_view=False):
+        # ── 更新前儲存目前視窗範圍（X、Y 均保留使用者設定）──
+        try:
+            _vr = self.price_plot.vb.viewRange()
+            _saved_x = _vr[0]   # [x_min, x_max]
+            _saved_y = _vr[1]   # [y_min, y_max]
+            _old_len = len(self._df_cache) if self._df_cache is not None else 0
+        except Exception:
+            _saved_x = None
+            _saved_y = None
+            _old_len = 0
+
         self.clear()
         if df is None or df.empty:
             self._df_cache = None
@@ -140,8 +151,47 @@ class StrategyChartWidget(QtWidgets.QWidget):
         ticks = [(idx, self._date_labels[idx]) for idx in range(0, len(df), tick_spacing)]
         self.price_plot.getAxis("bottom").setTicks([ticks])
         self.volume_plot.getAxis("bottom").setTicks([ticks])
-        self.price_plot.enableAutoRange(axis="y")
-        self.volume_plot.enableAutoRange(axis="y")
+
+        # ── 視窗範圍管理 ──
+        new_len = len(df)
+        if _old_len == 0 or _saved_x is None:
+            # 首次載入：顯示全部資料，Y 軸範圍 = 最高+100 / 最低-100
+            self.price_plot.setXRange(-0.5, new_len - 0.5, padding=0)
+            y_hi = float(df["High"].max()) + 100
+            y_lo = float(df["Low"].min()) - 100
+            self.price_plot.setYRange(y_lo, y_hi, padding=0)
+            vol_max = float(df["Volume"].fillna(0).max())
+            self.volume_plot.setYRange(0, vol_max * 1.1, padding=0)
+        else:
+            # 後續更新：還原 X 軸（跟隨新資料）
+            new_bars = new_len - _old_len
+            at_right_edge = _saved_x[1] >= _old_len - 2
+            if at_right_edge and new_bars > 0:
+                x_min = _saved_x[0] + new_bars
+                x_max = _saved_x[1] + new_bars
+            else:
+                x_min = _saved_x[0]
+                x_max = _saved_x[1]
+            x_min = max(x_min, -0.5)
+            x_max = min(x_max, new_len - 0.5)
+            self.price_plot.setXRange(x_min, x_max, padding=0)
+
+            if reset_view:
+                # 手動重新載入：重設 X 為全範圍，Y 依全部 K 棒重算
+                self.price_plot.setXRange(-0.5, new_len - 0.5, padding=0)
+                y_hi = float(df["High"].max()) + 100
+                y_lo = float(df["Low"].min()) - 100
+                self.price_plot.setYRange(y_lo, y_hi, padding=0)
+                vol_max = float(df["Volume"].fillna(0).max())
+                self.volume_plot.setYRange(0, vol_max * 1.1, padding=0)
+            else:
+                # 自動刷新：Y 軸完全不動
+                self.price_plot.setYRange(_saved_y[0], _saved_y[1], padding=0)
+                i0 = max(0, int(x_min))
+                i1 = min(new_len - 1, int(x_max) + 1)
+                visible_vol = df["Volume"].fillna(0).iloc[i0:i1 + 1]
+                if not visible_vol.empty:
+                    self.volume_plot.setYRange(0, float(visible_vol.max()) * 1.25, padding=0)
 
     # ─── K 棒點擊：顯示 OHLC ─────────────────────────────────────
     def _on_chart_clicked(self, event):

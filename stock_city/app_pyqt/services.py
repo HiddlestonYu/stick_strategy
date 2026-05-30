@@ -18,6 +18,9 @@ from stock_city.strategy.ma20_ma60 import get_strategy_registry, run_selected_st
 DEFAULT_PRODUCT = "台指期貨 (TXF)"
 DEFAULT_STRATEGY_KEYS = ["ma60_ma100_sr_entry"]
 AUTO_RISK_STOP_LOSS_QUANTILE = 0.80
+
+# ── 測試/模擬模式：True = 僅顯示訊息，不實際送出委託 ──
+ORDER_SIMULATION_MODE = True
 AUTO_RISK_PROFIT_TRIGGER_QUANTILE = 0.65
 AUTO_RISK_TRAILING_RATIO = 0.50
 AUTO_BACKTEST_PERIOD_OPTIONS = {
@@ -586,20 +589,25 @@ def place_futures_order(api, action: str, quantity: int, price=None) -> dict:
     """下台指期貨單。action: 'Buy'/'Sell'，price=None 市價。"""
     if api is None:
         raise ValueError("尚未登入 Shioaji。")
+    action_label = "多單" if action == "Buy" else "空單"
+    price_label = "市價" if price is None else f"限價 {float(price):.0f}"
+
+    if ORDER_SIMULATION_MODE:
+        msg = f"【模擬】{action_label} {quantity}口 {price_label}　（未實際送出委託）"
+        return {"order_id": "SIM", "status": "simulated", "msg": msg}
+
     contract = api.Contracts.Futures.TXF.TXFR1
     act = sj.constant.Action.Buy if action == "Buy" else sj.constant.Action.Sell
-    action_label = "多單" if action == "Buy" else "空單"
     if price is None:
         order = sj.Order(
             action=act,
             price=0,
             quantity=quantity,
-            order_type=sj.constant.OrderType.MKT,
+            order_type=sj.constant.OrderType.IOC,
             price_type=sj.constant.FuturesPriceType.MKT,
             octype=sj.constant.FuturesOCType.Auto,
             account=api.futopt_account,
         )
-        price_label = "市價"
     else:
         order = sj.Order(
             action=act,
@@ -610,7 +618,6 @@ def place_futures_order(api, action: str, quantity: int, price=None) -> dict:
             octype=sj.constant.FuturesOCType.Auto,
             account=api.futopt_account,
         )
-        price_label = f"限價 {float(price):.0f}"
     trade = api.place_order(contract, order)
     order_id = "-"
     status = "submitted"
@@ -638,6 +645,12 @@ def close_all_positions(api) -> dict:
     positions = result_data["positions"]
     if not positions:
         return {"status": "no_positions", "msg": "目前無持倉。", "order_id": "-"}
+
+    if ORDER_SIMULATION_MODE:
+        sim_msgs = [f"{p['direction']} {p['quantity']}口平倉" for p in positions if int(p['quantity']) > 0]
+        msg = "【模擬】平倉委託：" + "，".join(sim_msgs) + "　（未實際送出委託）" if sim_msgs else "無需平倉"
+        return {"status": "simulated", "msg": msg, "order_id": "SIM"}
+
     contract = api.Contracts.Futures.TXF.TXFR1
     msgs = []
     for pos in positions:
@@ -653,7 +666,7 @@ def close_all_positions(api) -> dict:
             action=close_action,
             price=0,
             quantity=qty,
-            order_type=sj.constant.OrderType.MKT,
+            order_type=sj.constant.OrderType.IOC,
             price_type=sj.constant.FuturesPriceType.MKT,
             octype=sj.constant.FuturesOCType.Auto,
             account=api.futopt_account,
