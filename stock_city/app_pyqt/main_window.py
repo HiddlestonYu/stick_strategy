@@ -1,4 +1,7 @@
-﻿from PyQt5 import QtCore, QtGui, QtWidgets
+﻿import os
+
+import pandas as pd
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from stock_city.app_pyqt.chart_widget import StrategyChartWidget
 from stock_city.app_pyqt.login_dialog import LoginDialog
@@ -18,7 +21,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_df = None
         self.current_trades = []
         self.current_backtest_trades = []
+        self.current_backtest_df = None
         self._workers = []
+        self._active_task_count = 0
         self._refresh_in_progress = False
         self._manual_refresh = True
         self._strategy_worker = None
@@ -254,7 +259,43 @@ class MainWindow(QtWidgets.QMainWindow):
         backtest_layout.addWidget(self.backtest_trade_table)
         bottom_tabs.addTab(backtest_tab, "回測")
 
+        self.exec_progress = QtWidgets.QProgressBar()
+        self.exec_progress.setFixedWidth(300)
+        self.exec_progress.setVisible(False)
+        self.exec_progress.setTextVisible(True)
+        self.statusBar().addPermanentWidget(self.exec_progress)
         self.statusBar().showMessage("就緒")
+
+    def _start_progress(self, text, maximum=0):
+        self.exec_progress.setVisible(True)
+        if maximum and maximum > 0:
+            self.exec_progress.setRange(0, maximum)
+            self.exec_progress.setValue(0)
+            self.exec_progress.setFormat(f"{text} %v/%m")
+        else:
+            self.exec_progress.setRange(0, 0)
+            self.exec_progress.setFormat(f"{text} 進行中...")
+        self.statusBar().showMessage(text)
+
+    def _update_progress(self, value=None, text=None):
+        if not self.exec_progress.isVisible():
+            return
+        if text:
+            if self.exec_progress.maximum() > 0:
+                self.exec_progress.setFormat(f"{text} %v/%m")
+            else:
+                self.exec_progress.setFormat(f"{text} 進行中...")
+            self.statusBar().showMessage(text)
+        if value is not None and self.exec_progress.maximum() > 0:
+            self.exec_progress.setValue(max(0, min(int(value), self.exec_progress.maximum())))
+        QtWidgets.QApplication.processEvents()
+
+    def _finish_progress(self, text="完成"):
+        if self.exec_progress.isVisible():
+            if self.exec_progress.maximum() > 0:
+                self.exec_progress.setValue(self.exec_progress.maximum())
+            self.exec_progress.setVisible(False)
+        self.statusBar().showMessage(text, 3000)
 
     def _build_price_ticker(self):
         frame = QtWidgets.QFrame()
@@ -392,19 +433,25 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.failed.connect(lambda msg: self._on_worker_error(msg, silent=silent))
         worker.finished.connect(lambda: self._cleanup_worker(worker))
         self._workers.append(worker)
+        self._active_task_count += 1
         if not silent:
-            self.statusBar().showMessage("背景作業執行中...")
+            self._start_progress("背景作業", maximum=0)
         worker.start()
 
     def _cleanup_worker(self, worker):
         if worker in self._workers:
             self._workers.remove(worker)
+        self._active_task_count = max(0, self._active_task_count - 1)
         if worker is getattr(self, "_strategy_worker", None):
             self._strategy_worker = None
+        if self._active_task_count == 0:
+            self._finish_progress("作業完成")
 
     def _on_worker_error(self, message, silent=False):
         self._set_busy(False)
         self._refresh_in_progress = False
+        self._active_task_count = 0
+        self._finish_progress("作業失敗")
         if silent:
             self.statusBar().showMessage(f"更新失敗：{message}", 5000)
         else:
@@ -494,6 +541,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_busy(True)
         period_label = self.backtest_period_combo.currentText()
         period_days = services.AUTO_BACKTEST_PERIOD_OPTIONS[period_label]
+        self._start_progress("回測中", maximum=0)
         self._run_worker(
             services.run_backtest_bundle,
             self._on_backtest_done,
@@ -507,6 +555,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_backtest_done(self, result):
         self._set_busy(False)
         self.current_backtest_trades = result["trades"]
+        self.current_backtest_df = result.get("df")
         self.backtest_metrics_label.setText(
             self._format_metrics_html(f"回測（{result['period_days']}天）", result["metrics"])
         )
@@ -617,32 +666,160 @@ class MainWindow(QtWidgets.QMainWindow):
     def export_current_trades(self):
         if not self.current_trades:
             return
-        out_dir, trade_csv, summary_csv = services.export_backtest_results_to_folder(
+        out_dir, trade_csv, summary_csv, image_dir = services.export_backtest_results_to_folder(
             self.current_trades,
             interval=self.interval_combo.currentText(),
             session=self.session_combo.currentText(),
             period_label="目前視窗",
             selected_strategy_keys=self._selected_strategy_keys(),
+            backtest_df=self.current_df,
+        )
+        image_dir, image_count = self._export_trade_images_from_chart(
+            trades=self.current_trades,
+            source_df=self.current_df,
+            out_dir=out_dir,
+            trade_csv_path=trade_csv,
+            title_prefix="目前視窗",
         )
         QtWidgets.QMessageBox.information(
             self, "匯出完成",
-            f"資料夾：{out_dir}\n明細：{trade_csv}\n摘要：{summary_csv}",
+            f"資料夾：{out_dir}\n明細：{trade_csv}\n摘要：{summary_csv}\n截圖：{image_dir}\n張數：{image_count}",
         )
 
     def export_backtest_results(self):
         if not self.current_backtest_trades:
             return
-        out_dir, trade_csv, summary_csv = services.export_backtest_results_to_folder(
+        out_dir, trade_csv, summary_csv, image_dir = services.export_backtest_results_to_folder(
             self.current_backtest_trades,
             interval=self.interval_combo.currentText(),
             session=self.session_combo.currentText(),
             period_label=self.backtest_period_combo.currentText(),
             selected_strategy_keys=self._selected_strategy_keys(),
+            backtest_df=self.current_backtest_df,
+        )
+        image_dir, image_count = self._export_trade_images_from_chart(
+            trades=self.current_backtest_trades,
+            source_df=self.current_backtest_df,
+            out_dir=out_dir,
+            trade_csv_path=trade_csv,
+            title_prefix=f"回測-{self.backtest_period_combo.currentText()}",
         )
         QtWidgets.QMessageBox.information(
             self, "匯出完成",
-            f"資料夾：{out_dir}\n明細：{trade_csv}\n摘要：{summary_csv}",
+            f"資料夾：{out_dir}\n明細：{trade_csv}\n摘要：{summary_csv}\n截圖：{image_dir}\n張數：{image_count}",
         )
+
+    def _export_trade_images_from_chart(self, trades, source_df, out_dir, trade_csv_path, title_prefix):
+        image_dir = os.path.join(out_dir, "trade_images")
+        os.makedirs(image_dir, exist_ok=True)
+        if source_df is None or source_df.empty or not trades:
+            return image_dir, 0
+
+        backup_df = self.current_df
+        backup_trades = self.current_trades
+
+        image_rows = []
+        total_steps = len(trades) * 3
+        self._start_progress("匯出交易截圖", maximum=total_steps)
+        step = 0
+        created_count = 0
+
+        for i, trade in enumerate(trades, 1):
+            entry_idx = int(trade.get("entry_idx", -1))
+            exit_idx = int(trade.get("exit_idx", -1))
+            if entry_idx < 0 and exit_idx < 0:
+                image_rows.append({"entry_image": "", "exit_image": "", "full_image": ""})
+                step += 3
+                self._update_progress(step, text=f"匯出交易截圖 ({i}/{len(trades)})")
+                continue
+
+            valid_idxs = [x for x in (entry_idx, exit_idx) if x >= 0]
+            left_idx = min(valid_idxs)
+            right_idx = max(valid_idxs)
+            window_left = max(0, left_idx - 80)
+            window_right = min(len(source_df) - 1, right_idx + 80)
+            window_df = source_df.iloc[window_left:window_right + 1].copy()
+            if window_df.empty:
+                image_rows.append({"entry_image": "", "exit_image": "", "full_image": ""})
+                step += 3
+                self._update_progress(step, text=f"匯出交易截圖 ({i}/{len(trades)})")
+                continue
+
+            local_trade = dict(trade)
+            if entry_idx >= 0:
+                local_trade["entry_idx"] = entry_idx - window_left
+            if exit_idx >= 0:
+                local_trade["exit_idx"] = exit_idx - window_left
+            self.chart_widget.update_chart(window_df, trades=[local_trade], reset_view=True)
+
+            # 在截圖上方標示 MA 顏色，對應主圖視覺風格。
+            self.chart_widget.ohlc_label.setText(
+                "  MA20: <span style='color:#f4a261'><b>橘色</b></span>　"
+                "MA60: <span style='color:#8d5cf6'><b>紫色</b></span>　"
+                "MA100: <span style='color:#4ecdc4'><b>青綠色</b></span>"
+                f"　{title_prefix} Trade {i:04d}"
+            )
+            self.chart_widget.ohlc_label.setStyleSheet(
+                "background:#1a1a2e; color:#e0e0e0; padding:4px 8px; font-size:13px;"
+            )
+            QtWidgets.QApplication.processEvents()
+
+            entry_rel = ""
+            exit_rel = ""
+            full_rel = ""
+
+            full_name = f"trade_{i:04d}_full.png"
+            full_path = os.path.join(image_dir, full_name)
+            if self.chart_widget.grab().save(full_path, "PNG"):
+                full_rel = os.path.relpath(full_path, out_dir)
+                created_count += 1
+            step += 1
+            self._update_progress(step, text=f"匯出交易截圖 ({i}/{len(trades)})")
+
+            if entry_idx >= 0:
+                self.chart_widget._select_vline.setValue(local_trade["entry_idx"])
+                self.chart_widget._select_vline.setVisible(True)
+                entry_name = f"trade_{i:04d}_entry.png"
+                entry_path = os.path.join(image_dir, entry_name)
+                if self.chart_widget.grab().save(entry_path, "PNG"):
+                    entry_rel = os.path.relpath(entry_path, out_dir)
+                    created_count += 1
+            step += 1
+            self._update_progress(step, text=f"匯出交易截圖 ({i}/{len(trades)})")
+
+            if exit_idx >= 0:
+                self.chart_widget._select_vline.setValue(local_trade["exit_idx"])
+                self.chart_widget._select_vline.setVisible(True)
+                exit_name = f"trade_{i:04d}_exit.png"
+                exit_path = os.path.join(image_dir, exit_name)
+                if self.chart_widget.grab().save(exit_path, "PNG"):
+                    exit_rel = os.path.relpath(exit_path, out_dir)
+                    created_count += 1
+            step += 1
+            self._update_progress(step, text=f"匯出交易截圖 ({i}/{len(trades)})")
+
+            image_rows.append({"entry_image": entry_rel, "exit_image": exit_rel, "full_image": full_rel})
+
+        try:
+            trades_df = pd.read_csv(trade_csv_path, encoding="utf-8-sig")
+            trades_df["entry_image"] = ""
+            trades_df["exit_image"] = ""
+            trades_df["full_image"] = ""
+            for idx, row in enumerate(image_rows):
+                if idx >= len(trades_df):
+                    break
+                trades_df.at[idx, "entry_image"] = row.get("entry_image", "")
+                trades_df.at[idx, "exit_image"] = row.get("exit_image", "")
+                trades_df.at[idx, "full_image"] = row.get("full_image", "")
+            trades_df.to_csv(trade_csv_path, index=False, encoding="utf-8-sig")
+        except Exception:
+            pass
+
+        if backup_df is not None and not backup_df.empty:
+            self.chart_widget.update_chart(backup_df, trades=backup_trades, reset_view=False)
+
+        self._finish_progress("截圖匯出完成")
+        return image_dir, created_count
 
     def _format_metrics_html(self, title, metrics):
         pf = metrics["profit_factor"]

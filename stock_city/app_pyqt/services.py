@@ -444,7 +444,7 @@ def run_backtest_bundle(interval, session, strategy_keys=None, risk_config=None,
     }
 
 
-def export_backtest_results_to_folder(bt_trades, interval, session, period_label, selected_strategy_keys):
+def export_backtest_results_to_folder(bt_trades, interval, session, period_label, selected_strategy_keys, backtest_df=None):
     taipei_tz = pytz.timezone("Asia/Taipei")
     now_str = datetime.now(taipei_tz).strftime("%Y%m%d_%H%M%S")
     strategy_keys = [str(key) for key in (selected_strategy_keys or DEFAULT_STRATEGY_KEYS)]
@@ -455,6 +455,8 @@ def export_backtest_results_to_folder(bt_trades, interval, session, period_label
     folder_name = f"pyqt_{strategy_tag}_{session}_{interval}_{period_label}_{now_str}"
     out_dir = os.path.join(output_root, folder_name)
     os.makedirs(out_dir, exist_ok=True)
+    image_dir = os.path.join(out_dir, "trade_images")
+    os.makedirs(image_dir, exist_ok=True)
 
     records = []
     for i, trade in enumerate(bt_trades, 1):
@@ -472,6 +474,9 @@ def export_backtest_results_to_folder(bt_trades, interval, session, period_label
             "max_loss_points": float(trade.get("max_loss_points", 0) or 0),
             "max_profit_points": float(trade.get("max_profit_points", 0) or 0),
             "exit_reason": trade.get("exit_reason", ""),
+            "entry_image": "",
+            "exit_image": "",
+            "full_image": "",
         })
 
     trades_df = pd.DataFrame(records)
@@ -495,7 +500,7 @@ def export_backtest_results_to_folder(bt_trades, interval, session, period_label
     ])
     summary_csv_path = os.path.join(out_dir, "summary.csv")
     summary_df.to_csv(summary_csv_path, index=False, encoding="utf-8-sig")
-    return out_dir, trade_csv_path, summary_csv_path
+    return out_dir, trade_csv_path, summary_csv_path, image_dir
 
 
 # ══════════════════ Tick 訂閱 ══════════════════
