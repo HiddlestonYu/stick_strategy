@@ -205,10 +205,24 @@ def update_today_data_if_needed(api, session):
     if today.weekday() >= 5 and now.hour >= 6:
         return 0
 
-    latest_ts = get_latest_tick_timestamp(code="TXFR1", date=today)
-    need_update = latest_ts is None
-    if latest_ts is not None and market_is_open:
-        latest_local = latest_ts.astimezone(taipei_tz) if getattr(latest_ts, "tzinfo", None) else pytz.UTC.localize(latest_ts).astimezone(taipei_tz)
+    # 凌晨 00:00~05:59 的夜盤延續時段，需要同時檢查「昨天 + 今天」是否有資料。
+    # 避免今天已經有 00:xx 資料時，誤判為不需更新，導致昨晚 15:00~23:59 缺失。
+    check_dates = [today]
+    if now.hour < 6:
+        check_dates = [today - timedelta(days=1), today]
+
+    latest_by_date = {
+        d: get_latest_tick_timestamp(code="TXFR1", date=d)
+        for d in check_dates
+    }
+
+    # 只要有任一日期完全沒資料，就必須更新。
+    need_update = any(ts is None for ts in latest_by_date.values())
+
+    # 盤中再加上時效檢查：最新資料若落後 2 分鐘也更新。
+    if (not need_update) and market_is_open:
+        newest_ts = max(latest_by_date.values())
+        latest_local = newest_ts.astimezone(taipei_tz) if getattr(newest_ts, "tzinfo", None) else pytz.UTC.localize(newest_ts).astimezone(taipei_tz)
         need_update = latest_local < now - timedelta(minutes=2)
 
     if not need_update:
@@ -227,7 +241,15 @@ def update_today_data_if_needed(api, session):
     df["ts"] = pd.to_datetime(df["ts"])
     df = df.rename(columns={"ts": "datetime"}).sort_values("datetime").reset_index(drop=True)
     df = df.set_index("datetime").sort_index()
-    df = df[df.index.date == today]
+
+    # 凌晨 00:00~05:59 屬於夜盤延續時段，需同時保留「昨晚 + 今日」資料，
+    # 否則會遺失同一交易夜盤的前半段（15:00~23:59）。
+    if now.hour < 6:
+        yesterday = today - timedelta(days=1)
+        valid_dates = {yesterday, today}
+        df = df[pd.Index(df.index.date).isin(valid_dates)]
+    else:
+        df = df[df.index.date == today]
     if df.empty:
         return 0
 

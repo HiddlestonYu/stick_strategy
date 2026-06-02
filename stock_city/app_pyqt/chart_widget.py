@@ -40,6 +40,7 @@ class StrategyChartWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self._date_labels = []
         self._df_cache = None
+        self._legend = None
         self._build_ui()
 
     def _build_ui(self):
@@ -59,6 +60,7 @@ class StrategyChartWidget(QtWidgets.QWidget):
         self.volume_plot = self.graphics_layout.addPlot(row=1, col=0)
         self.volume_plot.setMaximumHeight(100)
         self.volume_plot.setXLink(self.price_plot)
+        self._legend = self.price_plot.addLegend(offset=(10, 10))
 
         self.price_plot.showGrid(x=True, y=True, alpha=0.2)
         self.volume_plot.showGrid(x=True, y=True, alpha=0.2)
@@ -117,6 +119,12 @@ class StrategyChartWidget(QtWidgets.QWidget):
         candle_item.set_data(candle_data)
         self.price_plot.addItem(candle_item)
 
+        if self._legend is not None:
+            try:
+                self._legend.clear()
+            except Exception:
+                pass
+
         self.price_plot.plot(x_values, df["MA20"].astype(float).tolist(), pen=pg.mkPen("#f4a261", width=1.5), name="MA20", connect="finite")
         self.price_plot.plot(x_values, df["MA60"].astype(float).tolist(), pen=pg.mkPen("#8d5cf6", width=1.5), name="MA60", connect="finite")
         self.price_plot.plot(x_values, df["MA100"].astype(float).tolist(), pen=pg.mkPen("#4ecdc4", width=1.5), name="MA100", connect="finite")
@@ -126,23 +134,34 @@ class StrategyChartWidget(QtWidgets.QWidget):
         self.volume_plot.addItem(volume_item)
 
         if trades:
-            entry_x = []
-            entry_y = []
+            long_entry_x = []
+            long_entry_y = []
+            short_entry_x = []
+            short_entry_y = []
             exit_x = []
             exit_y = []
             for trade in trades:
                 entry_idx = int(trade.get("entry_idx", 0))
                 exit_idx = int(trade.get("exit_idx", 0))
+                direction = str(trade.get("direction", "")).upper()
                 if 0 <= entry_idx < len(df):
-                    entry_x.append(entry_idx)
-                    entry_y.append(float(df.iloc[entry_idx]["Close"]))
+                    entry_price = float(df.iloc[entry_idx]["Close"])
+                    if direction == "SHORT":
+                        short_entry_x.append(entry_idx)
+                        short_entry_y.append(entry_price)
+                    else:
+                        long_entry_x.append(entry_idx)
+                        long_entry_y.append(entry_price)
                 if 0 <= exit_idx < len(df):
                     exit_x.append(exit_idx)
                     exit_y.append(float(df.iloc[exit_idx]["Close"]))
 
-            if entry_x:
-                entry_item = pg.ScatterPlotItem(entry_x, entry_y, symbol="t1", size=14, brush=pg.mkBrush("#ffd166"), pen=pg.mkPen("#ffffff", width=1.5))
-                self.price_plot.addItem(entry_item)
+            if long_entry_x:
+                long_entry_item = pg.ScatterPlotItem(long_entry_x, long_entry_y, symbol="t1", size=14, brush=pg.mkBrush("#ffd166"), pen=pg.mkPen("#ffffff", width=1.5))
+                self.price_plot.addItem(long_entry_item)
+            if short_entry_x:
+                short_entry_item = pg.ScatterPlotItem(short_entry_x, short_entry_y, symbol="t", size=14, brush=pg.mkBrush("#7bdff2"), pen=pg.mkPen("#ffffff", width=1.5))
+                self.price_plot.addItem(short_entry_item)
             if exit_x:
                 exit_item = pg.ScatterPlotItem(exit_x, exit_y, symbol="o", size=10, brush=pg.mkBrush("#ef476f"), pen=pg.mkPen("#ffee58", width=1.2))
                 self.price_plot.addItem(exit_item)
@@ -197,10 +216,13 @@ class StrategyChartWidget(QtWidgets.QWidget):
     def _on_chart_clicked(self, event):
         if self._df_cache is None or self._df_cache.empty:
             return
-        pos = event.pos()
-        if not self.price_plot.sceneBoundingRect().contains(pos):
+
+        # 使用 scenePos 對應 ViewBox，避免座標系偏移造成選到前幾根 K 棒。
+        scene_pos = event.scenePos() if hasattr(event, "scenePos") else event.pos()
+        if not self.price_plot.vb.sceneBoundingRect().contains(scene_pos):
             return
-        view_pos = self.price_plot.vb.mapSceneToView(pos)
+
+        view_pos = self.price_plot.vb.mapSceneToView(scene_pos)
         x_idx = int(round(view_pos.x()))
         if x_idx < 0 or x_idx >= len(self._df_cache):
             return
