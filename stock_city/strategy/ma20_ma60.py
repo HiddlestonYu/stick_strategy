@@ -4,6 +4,7 @@ import pandas as pd
 
 
 STRATEGY_MA60_MA100_SR_ENTRY = "ma60_ma100_sr_entry"
+STRATEGY_MASA_BOTTOM_PULLBACK = "masa_bottom_pullback"
 AUTO_RISK_MIN_LOOKBACK_DAYS = 365
 AUTO_RISK_MIN_TRADES = 12
 AUTO_RISK_STOP_LOSS_QUANTILE = 0.80
@@ -18,6 +19,10 @@ def get_strategy_registry():
         STRATEGY_MA60_MA100_SR_ENTRY: {
             "name": "MA60/MA100 撐壓進場",
             "func": calculate_ma60_ma100_support_resistance_signals,
+        },
+        STRATEGY_MASA_BOTTOM_PULLBACK: {
+            "name": "麻紗底部拉回（日K破底翻/5分進出）",
+            "func": calculate_masa_bottom_pullback_signals,
         }
     }
 
@@ -40,6 +45,11 @@ def _normalize_strategy_keys(strategy):
         "ma60_ma100": STRATEGY_MA60_MA100_SR_ENTRY,
         "ma60_ma100_sr_entry": STRATEGY_MA60_MA100_SR_ENTRY,
         "ma60_ma100_support_resistance_entry": STRATEGY_MA60_MA100_SR_ENTRY,
+        "2": STRATEGY_MASA_BOTTOM_PULLBACK,
+        "masa": STRATEGY_MASA_BOTTOM_PULLBACK,
+        "masa_bottom": STRATEGY_MASA_BOTTOM_PULLBACK,
+        "bottom_pullback": STRATEGY_MASA_BOTTOM_PULLBACK,
+        "masa_bottom_pullback": STRATEGY_MASA_BOTTOM_PULLBACK,
     }
 
     normalized = []
@@ -420,11 +430,18 @@ def calculate_ma60_ma100_support_resistance_signals(
     trades = []
     add_events = []
 
-    active_risk_params = risk_params
     config = risk_config or {}
+    active_risk_params = risk_params or config.get("_active_risk_params")
     stop_loss_quantile_cfg = float(config.get("stop_loss_quantile", AUTO_RISK_STOP_LOSS_QUANTILE))
     profit_trigger_quantile_cfg = float(config.get("profit_trigger_quantile", AUTO_RISK_PROFIT_TRIGGER_QUANTILE))
     trailing_ratio_cfg = float(config.get("trailing_ratio", AUTO_RISK_TRAILING_RATIO))
+    min_ma60_slope_points = float(config.get("min_ma60_slope_points", 0.0) or 0.0)
+    min_body_points = float(config.get("min_body_points", 0.0) or 0.0)
+    min_body_atr_ratio = float(config.get("min_body_atr_ratio", 0.0) or 0.0)
+    min_volume_ratio = float(config.get("min_volume_ratio", 0.0) or 0.0)
+    entry_exclude_open_minutes = int(config.get("entry_exclude_open_minutes", 0) or 0)
+    atr_window = int(config.get("atr_window", 14) or 14)
+    volume_window = int(config.get("volume_window", 20) or 20)
     if auto_risk and (not _calibration_mode) and active_risk_params is None:
         calibrate_df = _select_recent_df_by_days(df, AUTO_RISK_MIN_LOOKBACK_DAYS)
         if calibrate_df is not None and len(calibrate_df) >= min_bars:
@@ -455,6 +472,19 @@ def calculate_ma60_ma100_support_resistance_signals(
     if "MA100" not in df.columns:
         df["MA100"] = df["Close"].rolling(window=100).mean()
     df["MA60_slope"] = df["MA60"].diff()
+    if min_body_atr_ratio > 0:
+        prev_close = df["Close"].shift(1)
+        true_range = pd.concat(
+            [
+                df["High"] - df["Low"],
+                (df["High"] - prev_close).abs(),
+                (df["Low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        df["ATR_FILTER"] = true_range.rolling(window=atr_window).mean()
+    if min_volume_ratio > 0:
+        df["VOLUME_AVG_FILTER"] = df["Volume"].rolling(window=volume_window).mean().shift(1)
 
     position = None
     buffer_points = 10.0
@@ -516,6 +546,46 @@ def calculate_ma60_ma100_support_resistance_signals(
         delta = close_dt - ts
         return delta.total_seconds() / 60.0
 
+    def minutes_from_session_open(ts):
+        if not hasattr(ts, "tzinfo") or ts.tzinfo is None:
+            taipei_tz = pytz.timezone("Asia/Taipei")
+            ts = taipei_tz.localize(ts)
+        else:
+            ts = ts.astimezone(pytz.timezone("Asia/Taipei"))
+
+        day = ts.date()
+        taipei_tz = pytz.timezone("Asia/Taipei")
+        if session == "夜盤":
+            if ts.hour < 12:
+                open_day = day - timedelta(days=1)
+            else:
+                open_day = day
+            open_dt = taipei_tz.localize(datetime(open_day.year, open_day.month, open_day.day, 15, 0))
+        else:
+            open_dt = taipei_tz.localize(datetime(day.year, day.month, day.day, 8, 45))
+        return (ts - open_dt).total_seconds() / 60.0
+
+    def passes_entry_filters(row_curr, minutes_from_open):
+        body_points = abs(float(row_curr["Close"]) - float(row_curr["Open"]))
+
+        if min_ma60_slope_points > 0 and abs(float(row_curr["MA60_slope"])) < min_ma60_slope_points:
+            return False
+        if min_body_points > 0 and body_points < min_body_points:
+            return False
+        if min_body_atr_ratio > 0:
+            atr_value = row_curr.get("ATR_FILTER")
+            if pd.isna(atr_value) or body_points < float(atr_value) * min_body_atr_ratio:
+                return False
+        if min_volume_ratio > 0:
+            volume_avg = row_curr.get("VOLUME_AVG_FILTER")
+            if pd.isna(volume_avg) or float(volume_avg) <= 0:
+                return False
+            if float(row_curr.get("Volume", 0) or 0) < float(volume_avg) * min_volume_ratio:
+                return False
+        if entry_exclude_open_minutes > 0 and minutes_from_open < entry_exclude_open_minutes:
+            return False
+        return True
+
     for i in range(1, len(df)):
         row_prev = df.iloc[i - 1]
         row_curr = df.iloc[i]
@@ -549,6 +619,7 @@ def calculate_ma60_ma100_support_resistance_signals(
         same_day_signal = prev_date == curr_date
 
         minutes_left = minutes_to_session_close(df.index[i])
+        minutes_from_open = minutes_from_session_open(df.index[i])
         cutoff_reached = minutes_left <= 30
 
         if position is None:
@@ -558,6 +629,7 @@ def calculate_ma60_ma100_support_resistance_signals(
                 and engulf_up
                 and same_day_signal
                 and (not cutoff_reached)
+                and passes_entry_filters(row_curr, minutes_from_open)
             ):
                 position = "LONG"
                 entry_idx = i
@@ -571,6 +643,7 @@ def calculate_ma60_ma100_support_resistance_signals(
                 and engulf_down
                 and same_day_signal
                 and (not cutoff_reached)
+                and passes_entry_filters(row_curr, minutes_from_open)
             ):
                 position = "SHORT"
                 entry_idx = i
@@ -758,6 +831,229 @@ def calculate_ma60_ma100_support_resistance_signals(
             "max_profit_points": max_profit_points,
             "exit_reason": "最後一根收盤",
         })
+
+    return trades, add_events
+
+
+def _build_daily_bars_from_intraday(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+
+    daily = (
+        df.assign(_trade_date=df.index.date)
+        .groupby("_trade_date")
+        .agg(
+            Open=("Open", "first"),
+            High=("High", "max"),
+            Low=("Low", "min"),
+            Close=("Close", "last"),
+            Volume=("Volume", "sum"),
+        )
+        .dropna()
+    )
+    daily.index = pd.to_datetime(daily.index)
+    return daily
+
+
+def _compute_trade_excursions_from_df(df, start_idx, end_idx, direction, base_entry_price):
+    if start_idx is None or end_idx is None:
+        return 0.0, 0.0
+
+    window = df.iloc[int(start_idx): int(end_idx) + 1]
+    if window.empty:
+        return 0.0, 0.0
+
+    high_max = float(window["High"].max())
+    low_min = float(window["Low"].min())
+    entry_px = float(base_entry_price)
+
+    if direction == "LONG":
+        max_loss = max(0.0, entry_px - low_min)
+        max_profit = max(0.0, high_max - entry_px)
+    else:
+        max_loss = max(0.0, high_max - entry_px)
+        max_profit = max(0.0, entry_px - low_min)
+
+    return float(max_loss), float(max_profit)
+
+
+def calculate_masa_bottom_pullback_signals(
+    df,
+    min_bars=600,
+    session="日盤",
+    is_realtime=False,
+    risk_config=None,
+):
+    """
+    麻紗老師底部拉回 v1：日K找破底翻，5分K回測支撐後進出場。
+
+    使用方式：
+    - 請用 5m K 資料執行此策略。
+    - 程式會由 5m 自動彙整日K，前一日收盤形成破底翻 setup 後，
+      下一交易日用 5m 等回測與重新站回再進場。
+    """
+    if df is None or len(df) < min_bars or not isinstance(df.index, pd.DatetimeIndex):
+        return [], []
+
+    config = risk_config or {}
+    box_lookback_bars = int(config.get("masa_box_lookback_bars", 20) or 20)
+    box_min_bars = int(config.get("masa_box_min_bars", 8) or 8)
+    box_low_quantile = float(config.get("masa_box_low_quantile", 0.25) or 0.25)
+    box_max_range_points = float(config.get("masa_box_max_range_points", 0.0) or 0.0)
+    break_buffer = float(config.get("masa_break_buffer_points", 0.0) or 0.0)
+    reclaim_buffer = float(config.get("masa_reclaim_buffer_points", 0.0) or 0.0)
+    open_low_tolerance = float(config.get("masa_open_low_tolerance_points", 0.0) or 0.0)
+    support_touch_buffer = float(config.get("masa_support_touch_buffer_points", 5.0) or 5.0)
+    confirm_buffer = float(config.get("masa_confirm_buffer_points", 0.0) or 0.0)
+    stop_buffer = float(config.get("masa_stop_buffer_points", 0.0) or 0.0)
+    support_fail_buffer = float(config.get("masa_support_fail_buffer_points", 0.0) or 0.0)
+    take_profit_points = float(config.get("masa_take_profit_points", 0.0) or 0.0)
+    max_hold_bars = int(config.get("masa_max_hold_bars", 240) or 240)
+    max_entry_bars = int(config.get("masa_max_entry_bars", 60) or 60)
+    allow_same_day_exit = bool(config.get("masa_allow_same_day_exit", True))
+
+    df = df.copy()
+    daily = _build_daily_bars_from_intraday(df)
+    if len(daily) < box_lookback_bars + 2:
+        return [], []
+
+    intraday_dates = pd.Series(df.index.date, index=df.index)
+    unique_dates = list(pd.unique(intraday_dates))
+    date_to_position = {date_value: idx for idx, date_value in enumerate(unique_dates)}
+    trades = []
+    add_events = []
+    next_available_idx = 0
+
+    for setup_daily_idx in range(box_lookback_bars, len(daily) - 1):
+        setup_date = daily.index[setup_daily_idx].date()
+        if setup_date not in date_to_position:
+            continue
+
+        prior = daily.iloc[setup_daily_idx - box_lookback_bars: setup_daily_idx]
+        if len(prior) < box_min_bars:
+            continue
+
+        body_lows = prior[["Open", "Close"]].min(axis=1)
+        body_highs = prior[["Open", "Close"]].max(axis=1)
+        box_low = float(body_lows.quantile(box_low_quantile))
+        box_high = float(max(prior["High"].max(), body_highs.quantile(0.75)))
+        if box_high <= box_low:
+            continue
+        if box_max_range_points > 0 and (box_high - box_low) > box_max_range_points:
+            continue
+
+        setup_bar = daily.iloc[setup_daily_idx]
+        breakdown = float(setup_bar["Low"]) < box_low - break_buffer
+        reclaim = float(setup_bar["Close"]) > box_low + reclaim_buffer
+        if not (breakdown and reclaim):
+            continue
+
+        next_daily_date = daily.index[setup_daily_idx + 1].date()
+        if next_daily_date not in date_to_position:
+            continue
+
+        entry_mask = intraday_dates == next_daily_date
+        entry_day_df = df[entry_mask]
+        if entry_day_df.empty:
+            continue
+
+        day_start_idx = df.index.get_loc(entry_day_df.index[0])
+        if day_start_idx < next_available_idx:
+            continue
+
+        next_open = float(entry_day_df.iloc[0]["Open"])
+        setup_close = float(setup_bar["Close"])
+        if next_open < setup_close - open_low_tolerance:
+            add_events.append({
+                "type": "masa_skip_open_low",
+                "setup_date": setup_date,
+                "next_date": next_daily_date,
+                "next_open": next_open,
+                "setup_close": setup_close,
+            })
+            continue
+
+        entry_support = max(box_low, min(next_open, setup_close))
+        stop_reference = box_low
+        touched_support = False
+        entry_idx = None
+        entry_price = None
+
+        for local_i, (_, row) in enumerate(entry_day_df.iterrows()):
+            global_i = day_start_idx + local_i
+            if local_i >= max_entry_bars:
+                break
+
+            if float(row["Low"]) < stop_reference - stop_buffer:
+                break
+            if float(row["Low"]) <= entry_support + support_touch_buffer:
+                touched_support = True
+            if touched_support and float(row["Close"]) >= entry_support + confirm_buffer:
+                entry_idx = global_i
+                entry_price = float(row["Close"])
+                break
+
+        if entry_idx is None:
+            continue
+
+        exit_idx = None
+        exit_price = None
+        exit_reason = ""
+        max_exit_idx = min(len(df) - 1, entry_idx + max_hold_bars)
+
+        for i in range(entry_idx + 1, max_exit_idx + 1):
+            row = df.iloc[i]
+            if (not allow_same_day_exit) and df.index[i].date() == df.index[entry_idx].date():
+                continue
+
+            if float(row["Low"]) < stop_reference - stop_buffer:
+                exit_idx = i
+                exit_price = stop_reference - stop_buffer
+                exit_reason = "麻紗破底翻停損：再次跌破整理區底"
+                break
+            if float(row["Close"]) < entry_support - support_fail_buffer:
+                exit_idx = i
+                exit_price = float(row["Close"])
+                exit_reason = "麻紗破底翻停損：跌回回測支撐下方"
+                break
+            if take_profit_points > 0 and float(row["High"]) >= float(entry_price) + take_profit_points:
+                exit_idx = i
+                exit_price = float(entry_price) + take_profit_points
+                exit_reason = f"麻紗破底翻停利：固定{take_profit_points:.0f}點"
+                break
+
+        if exit_idx is None:
+            if is_realtime and max_exit_idx == len(df) - 1:
+                continue
+            exit_idx = max_exit_idx
+            exit_price = float(df.iloc[exit_idx]["Close"])
+            exit_reason = "麻紗破底翻出場：持有時間到"
+
+        max_loss_points, max_profit_points = _compute_trade_excursions_from_df(
+            df, entry_idx, exit_idx, "LONG", entry_price
+        )
+        trades.append({
+            "entry_idx": entry_idx,
+            "entry_ts": df.index[entry_idx],
+            "entry_price": entry_price,
+            "exit_idx": exit_idx,
+            "exit_ts": df.index[exit_idx],
+            "exit_price": exit_price,
+            "direction": "LONG",
+            "bars_held": int(exit_idx - entry_idx + 1),
+            "pnl": float(exit_price - entry_price),
+            "max_loss_points": max_loss_points,
+            "max_profit_points": max_profit_points,
+            "exit_reason": exit_reason,
+            "box_high": box_high,
+            "box_low": box_low,
+            "breakdown_low": float(setup_bar["Low"]),
+            "setup_close": setup_close,
+            "next_open": next_open,
+            "entry_support": entry_support,
+            "strategy_note": "日K破底翻，隔日5分K回測支撐後站回進場",
+        })
+        next_available_idx = exit_idx + 1
 
     return trades, add_events
 

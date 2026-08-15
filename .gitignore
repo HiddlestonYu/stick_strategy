@@ -54,6 +54,9 @@ test_*.py
 # Backtest outputs
 backtest_outputs/
 
+# Local video/screenshot/source media
+masa_video/
+
 # Database files
 *.db
 *.db-journal

@@ -1,3 +1,5 @@
+import math
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
@@ -36,11 +38,15 @@ class CandlestickItem(pg.GraphicsObject):
 
 
 class StrategyChartWidget(QtWidgets.QWidget):
-    def __init__(self, parent=None):
+    interval_requested = QtCore.pyqtSignal(str)
+
+    def __init__(self, title="K 線", parent=None, show_volume=False):
         super().__init__(parent)
         self._date_labels = []
         self._df_cache = None
         self._legend = None
+        self._title = title
+        self._show_volume = show_volume
         self._build_ui()
 
     def _build_ui(self):
@@ -49,7 +55,7 @@ class StrategyChartWidget(QtWidgets.QWidget):
         layout.setSpacing(0)
 
         # OHLC 資訊列
-        self.ohlc_label = QtWidgets.QLabel("  點擊 K 棒查看　開 / 高 / 低 / 收")
+        self.ohlc_label = QtWidgets.QLabel(f"  {self._title}　點擊 K 棒查看　開 / 高 / 低 / 收")
         self.ohlc_label.setStyleSheet(
             "background:#1a1a2e; color:#888888; padding:4px 8px; font-size:13px;"
         )
@@ -57,16 +63,20 @@ class StrategyChartWidget(QtWidgets.QWidget):
 
         self.graphics_layout = pg.GraphicsLayoutWidget()
         self.price_plot = self.graphics_layout.addPlot(row=0, col=0)
-        self.volume_plot = self.graphics_layout.addPlot(row=1, col=0)
-        self.volume_plot.setMaximumHeight(100)
-        self.volume_plot.setXLink(self.price_plot)
+        self.volume_plot = None
+        if self._show_volume:
+            self.volume_plot = self.graphics_layout.addPlot(row=1, col=0)
+            self.volume_plot.setMaximumHeight(100)
+            self.volume_plot.setXLink(self.price_plot)
         self._legend = self.price_plot.addLegend(offset=(10, 10))
 
         self.price_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.volume_plot.showGrid(x=True, y=True, alpha=0.2)
         self.price_plot.setLabel("left", "價格")
-        self.volume_plot.setLabel("left", "量")
-        self.volume_plot.setLabel("bottom", "時間")
+        self.price_plot.setLabel("bottom", "時間")
+        if self.volume_plot is not None:
+            self.volume_plot.showGrid(x=True, y=True, alpha=0.2)
+            self.volume_plot.setLabel("left", "量")
+            self.volume_plot.setLabel("bottom", "時間")
 
         # 垂直選取線
         self._select_vline = pg.InfiniteLine(
@@ -84,7 +94,8 @@ class StrategyChartWidget(QtWidgets.QWidget):
 
     def clear(self):
         self.price_plot.clear()
-        self.volume_plot.clear()
+        if self.volume_plot is not None:
+            self.volume_plot.clear()
         self._date_labels = []
         # price_plot.clear() 會移除所有 item，需重新加入選取線
         self.price_plot.addItem(self._select_vline)
@@ -97,10 +108,21 @@ class StrategyChartWidget(QtWidgets.QWidget):
             _saved_x = _vr[0]   # [x_min, x_max]
             _saved_y = _vr[1]   # [y_min, y_max]
             _old_len = len(self._df_cache) if self._df_cache is not None else 0
+            _saved_width = float(_saved_x[1] - _saved_x[0])
+            _saved_left_ts = None
+            _saved_left_offset = 0.0
+            if self._df_cache is not None and _old_len > 0:
+                left_floor = int(math.floor(_saved_x[0]))
+                left_idx = max(0, min(_old_len - 1, left_floor))
+                _saved_left_ts = self._df_cache.index[left_idx]
+                _saved_left_offset = float(_saved_x[0] - left_floor)
         except Exception:
             _saved_x = None
             _saved_y = None
             _old_len = 0
+            _saved_width = 0.0
+            _saved_left_ts = None
+            _saved_left_offset = 0.0
 
         self.clear()
         if df is None or df.empty:
@@ -129,9 +151,10 @@ class StrategyChartWidget(QtWidgets.QWidget):
         self.price_plot.plot(x_values, df["MA60"].astype(float).tolist(), pen=pg.mkPen("#8d5cf6", width=1.5), name="MA60", connect="finite")
         self.price_plot.plot(x_values, df["MA100"].astype(float).tolist(), pen=pg.mkPen("#4ecdc4", width=1.5), name="MA100", connect="finite")
 
-        volume_brushes = [pg.mkBrush("#ff6b6b") if float(row["Close"]) >= float(row["Open"]) else pg.mkBrush("#4ecdc4") for _, row in df.iterrows()]
-        volume_item = pg.BarGraphItem(x=x_values, height=df["Volume"].fillna(0).astype(float).tolist(), width=0.7, brushes=volume_brushes)
-        self.volume_plot.addItem(volume_item)
+        if self.volume_plot is not None:
+            volume_brushes = [pg.mkBrush("#ff6b6b") if float(row["Close"]) >= float(row["Open"]) else pg.mkBrush("#4ecdc4") for _, row in df.iterrows()]
+            volume_item = pg.BarGraphItem(x=x_values, height=df["Volume"].fillna(0).astype(float).tolist(), width=0.7, brushes=volume_brushes)
+            self.volume_plot.addItem(volume_item)
 
         if trades:
             long_entry_x = []
@@ -169,51 +192,81 @@ class StrategyChartWidget(QtWidgets.QWidget):
         tick_spacing = max(1, len(df) // 8)
         ticks = [(idx, self._date_labels[idx]) for idx in range(0, len(df), tick_spacing)]
         self.price_plot.getAxis("bottom").setTicks([ticks])
-        self.volume_plot.getAxis("bottom").setTicks([ticks])
+        if self.volume_plot is not None:
+            self.volume_plot.getAxis("bottom").setTicks([ticks])
 
         # ── 視窗範圍管理 ──
         new_len = len(df)
         if _old_len == 0 or _saved_x is None:
             # 首次載入：顯示全部資料，Y 軸範圍 = 最高+100 / 最低-100
-            self.price_plot.setXRange(-0.5, new_len - 0.5, padding=0)
+            x_min = -0.5
+            x_max = new_len - 0.5
+            self.price_plot.setXRange(x_min, x_max, padding=0)
             y_hi = float(df["High"].max()) + 100
             y_lo = float(df["Low"].min()) - 100
             self.price_plot.setYRange(y_lo, y_hi, padding=0)
-            vol_max = float(df["Volume"].fillna(0).max())
-            self.volume_plot.setYRange(0, vol_max * 1.1, padding=0)
+            if self.volume_plot is not None:
+                vol_max = float(df["Volume"].fillna(0).max())
+                self.volume_plot.setYRange(0, vol_max * 1.1, padding=0)
         else:
             # 後續更新：還原 X 軸（跟隨新資料）
-            new_bars = new_len - _old_len
-            at_right_edge = _saved_x[1] >= _old_len - 2
-            if at_right_edge and new_bars > 0:
-                x_min = _saved_x[0] + new_bars
-                x_max = _saved_x[1] + new_bars
-            else:
-                x_min = _saved_x[0]
-                x_max = _saved_x[1]
-            x_min = max(x_min, -0.5)
-            x_max = min(x_max, new_len - 0.5)
-            self.price_plot.setXRange(x_min, x_max, padding=0)
-
             if reset_view:
                 # 手動重新載入：重設 X 為全範圍，Y 依全部 K 棒重算
-                self.price_plot.setXRange(-0.5, new_len - 0.5, padding=0)
+                x_min = -0.5
+                x_max = new_len - 0.5
+                self.price_plot.setXRange(x_min, x_max, padding=0)
                 y_hi = float(df["High"].max()) + 100
                 y_lo = float(df["Low"].min()) - 100
                 self.price_plot.setYRange(y_lo, y_hi, padding=0)
-                vol_max = float(df["Volume"].fillna(0).max())
-                self.volume_plot.setYRange(0, vol_max * 1.1, padding=0)
+                if self.volume_plot is not None:
+                    vol_max = float(df["Volume"].fillna(0).max())
+                    self.volume_plot.setYRange(0, vol_max * 1.1, padding=0)
             else:
                 # 自動刷新：Y 軸完全不動
+                if _saved_left_ts is not None:
+                    new_left_idx = int(df.index.searchsorted(_saved_left_ts, side="left"))
+                    new_left_idx = max(0, min(new_len - 1, new_left_idx))
+                    x_min = new_left_idx + _saved_left_offset
+                    x_max = x_min + _saved_width
+                else:
+                    x_min = _saved_x[0]
+                    x_max = _saved_x[1]
+
+                if x_max > new_len - 0.5:
+                    overflow = x_max - (new_len - 0.5)
+                    x_min -= overflow
+                    x_max -= overflow
+                if x_min < -0.5:
+                    x_max += -0.5 - x_min
+                    x_min = -0.5
+                x_max = min(x_max, new_len - 0.5)
+                self.price_plot.setXRange(x_min, x_max, padding=0)
                 self.price_plot.setYRange(_saved_y[0], _saved_y[1], padding=0)
                 i0 = max(0, int(x_min))
                 i1 = min(new_len - 1, int(x_max) + 1)
                 visible_vol = df["Volume"].fillna(0).iloc[i0:i1 + 1]
-                if not visible_vol.empty:
+                if self.volume_plot is not None and not visible_vol.empty:
                     self.volume_plot.setYRange(0, float(visible_vol.max()) * 1.25, padding=0)
+
+    def set_title(self, title):
+        self._title = title
+        self.ohlc_label.setText(f"  {self._title}")
 
     # ─── K 棒點擊：顯示 OHLC ─────────────────────────────────────
     def _on_chart_clicked(self, event):
+        if hasattr(event, "button") and event.button() == QtCore.Qt.RightButton:
+            menu = QtWidgets.QMenu(self)
+            for label, interval in (
+                ("5 分 K", "5m"),
+                ("30 分 K", "30m"),
+                ("60 分 K", "60m"),
+                ("日 K", "1d"),
+            ):
+                action = menu.addAction(label)
+                action.triggered.connect(lambda checked=False, value=interval: self.interval_requested.emit(value))
+            menu.exec_(QtGui.QCursor.pos())
+            return
+
         if self._df_cache is None or self._df_cache.empty:
             return
 

@@ -19,9 +19,18 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.api = None
         self.current_df = None
+        self.current_daily_df = None
+        self.current_5m_df = None
+        self.current_top_chart_df = None
+        self.current_bottom_chart_df = None
+        self.top_chart_interval = "1d"
+        self.bottom_chart_interval = "5m"
         self.current_trades = []
         self.current_backtest_trades = []
         self.current_backtest_df = None
+        self.current_backtest_result = None
+        self.current_optimization_results = []
+        self._applied_optimization_risk_params = None
         self._workers = []
         self._active_task_count = 0
         self._refresh_in_progress = False
@@ -69,11 +78,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.interval_combo = QtWidgets.QComboBox()
         self.interval_combo.addItems(["1m", "5m", "15m", "30m", "60m", "1d"])
         self.interval_combo.setCurrentText("5m")
+        self.interval_combo.setVisible(False)
         self.session_combo = QtWidgets.QComboBox()
         self.session_combo.addItems(["日盤", "夜盤", "全盤"])
         self.kbars_spin = QtWidgets.QSpinBox()
-        self.kbars_spin.setRange(20, 2000)
-        self.kbars_spin.setValue(200)
+        self.kbars_spin.setRange(200, 3000)
+        self.kbars_spin.setValue(1200)
         self.auto_refresh_checkbox = QtWidgets.QCheckBox("自動刷新")
         self.auto_refresh_checkbox.setChecked(True)
         self.refresh_interval_spin = QtWidgets.QSpinBox()
@@ -82,9 +92,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_button = QtWidgets.QPushButton("重新載入")
         self.refresh_button.clicked.connect(self.refresh_data)
         self.session_combo.currentTextChanged.connect(self._on_session_changed)
-        data_form.addRow("K 線週期", self.interval_combo)
+        self.chart_interval_label = QtWidgets.QLabel("上方：日 K　下方：5 分 K")
+        data_form.addRow("圖表週期", self.chart_interval_label)
         data_form.addRow("時段", self.session_combo)
-        data_form.addRow("顯示 K 棒數", self.kbars_spin)
+        data_form.addRow("載入K棒數", self.kbars_spin)
         data_form.addRow(self.auto_refresh_checkbox)
         data_form.addRow("刷新間隔 (秒)", self.refresh_interval_spin)
         data_form.addRow(self.refresh_button)
@@ -98,6 +109,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.strategy_combo = QtWidgets.QComboBox()
         for key, name in services.get_strategy_options().items():
             self.strategy_combo.addItem(name, key)
+        self.strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
         self.stop_loss_quantile_spin = QtWidgets.QDoubleSpinBox()
         self.stop_loss_quantile_spin.setRange(0.50, 0.95)
         self.stop_loss_quantile_spin.setSingleStep(0.01)
@@ -110,6 +122,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trailing_ratio_spin.setRange(0.20, 1.00)
         self.trailing_ratio_spin.setSingleStep(0.05)
         self.trailing_ratio_spin.setValue(services.AUTO_RISK_TRAILING_RATIO)
+        self.min_ma60_slope_spin = QtWidgets.QDoubleSpinBox()
+        self.min_ma60_slope_spin.setRange(0, 20)
+        self.min_ma60_slope_spin.setSingleStep(1)
+        self.min_ma60_slope_spin.setValue(0)
+        self.min_body_points_spin = QtWidgets.QDoubleSpinBox()
+        self.min_body_points_spin.setRange(0, 100)
+        self.min_body_points_spin.setSingleStep(5)
+        self.min_body_points_spin.setValue(0)
+        self.min_body_atr_ratio_spin = QtWidgets.QDoubleSpinBox()
+        self.min_body_atr_ratio_spin.setRange(0, 2)
+        self.min_body_atr_ratio_spin.setSingleStep(0.05)
+        self.min_body_atr_ratio_spin.setValue(0)
+        self.min_volume_ratio_spin = QtWidgets.QDoubleSpinBox()
+        self.min_volume_ratio_spin.setRange(0, 5)
+        self.min_volume_ratio_spin.setSingleStep(0.1)
+        self.min_volume_ratio_spin.setValue(0)
+        self.entry_exclude_open_spin = QtWidgets.QSpinBox()
+        self.entry_exclude_open_spin.setRange(0, 60)
+        self.entry_exclude_open_spin.setSingleStep(5)
+        self.entry_exclude_open_spin.setValue(0)
         self.backtest_period_combo = QtWidgets.QComboBox()
         self.backtest_period_combo.addItems(list(services.AUTO_BACKTEST_PERIOD_OPTIONS.keys()))
         self.backtest_period_combo.setCurrentText("1年")
@@ -118,8 +150,84 @@ class MainWindow(QtWidgets.QMainWindow):
         strategy_form.addRow("停損分位", self.stop_loss_quantile_spin)
         strategy_form.addRow("停利分位", self.profit_trigger_quantile_spin)
         strategy_form.addRow("回撤比例", self.trailing_ratio_spin)
+        strategy_form.addRow("MA60最小斜率", self.min_ma60_slope_spin)
+        strategy_form.addRow("吞噬K最小實體", self.min_body_points_spin)
+        strategy_form.addRow("實體/ATR下限", self.min_body_atr_ratio_spin)
+        strategy_form.addRow("成交量均量倍數", self.min_volume_ratio_spin)
+        strategy_form.addRow("避開開盤(分)", self.entry_exclude_open_spin)
         strategy_form.addRow("回測期間", self.backtest_period_combo)
+        self.show_advanced_checkbox = QtWidgets.QCheckBox("顯示進階限制/風控")
+        self.show_advanced_checkbox.setChecked(False)
+        self.show_advanced_checkbox.toggled.connect(self._set_advanced_controls_visible)
+        strategy_form.addRow(self.show_advanced_checkbox)
         control_layout.addWidget(strategy_group)
+        self._advanced_controls = (
+            self.stop_loss_quantile_spin,
+            self.profit_trigger_quantile_spin,
+            self.trailing_ratio_spin,
+            self.min_ma60_slope_spin,
+            self.min_body_points_spin,
+            self.min_body_atr_ratio_spin,
+            self.min_volume_ratio_spin,
+            self.entry_exclude_open_spin,
+        )
+        self._advanced_form = strategy_form
+        self._set_advanced_controls_visible(False)
+        for filter_spin in (
+            self.stop_loss_quantile_spin,
+            self.profit_trigger_quantile_spin,
+            self.trailing_ratio_spin,
+            self.min_ma60_slope_spin,
+            self.min_body_points_spin,
+            self.min_body_atr_ratio_spin,
+            self.min_volume_ratio_spin,
+            self.entry_exclude_open_spin,
+        ):
+            filter_spin.valueChanged.connect(self._clear_applied_optimization_risk)
+
+        cost_group = QtWidgets.QGroupBox("交易損耗")
+        cost_form = QtWidgets.QFormLayout(cost_group)
+        cost_form.setSpacing(6)
+        self.contract_type_combo = QtWidgets.QComboBox()
+        self.contract_type_combo.addItems(list(services.get_contract_cost_presets().keys()))
+        self.contract_type_combo.setCurrentText("小台")
+        self.commission_spin = QtWidgets.QDoubleSpinBox()
+        self.commission_spin.setRange(0, 1000)
+        self.commission_spin.setDecimals(0)
+        self.commission_spin.setValue(25)
+        self.tax_spin = QtWidgets.QDoubleSpinBox()
+        self.tax_spin.setRange(0, 1000)
+        self.tax_spin.setDecimals(0)
+        self.tax_spin.setValue(28)
+        self.slippage_spin = QtWidgets.QDoubleSpinBox()
+        self.slippage_spin.setRange(0, 20)
+        self.slippage_spin.setDecimals(1)
+        self.slippage_spin.setSingleStep(0.5)
+        self.slippage_spin.setValue(2)
+        self.cost_hint_label = QtWidgets.QLabel("")
+        self.cost_hint_label.setWordWrap(True)
+        cost_form.addRow("商品", self.contract_type_combo)
+        cost_form.addRow("手續費/邊", self.commission_spin)
+        cost_form.addRow("交易稅/邊", self.tax_spin)
+        cost_form.addRow("滑價點/邊", self.slippage_spin)
+        cost_form.addRow(self.cost_hint_label)
+        self.show_cost_detail_checkbox = QtWidgets.QCheckBox("調整耗損內容")
+        self.show_cost_detail_checkbox.setChecked(False)
+        self.show_cost_detail_checkbox.toggled.connect(self._set_cost_controls_visible)
+        cost_form.addRow(self.show_cost_detail_checkbox)
+        self._cost_form = cost_form
+        self._cost_detail_controls = (
+            self.contract_type_combo,
+            self.commission_spin,
+            self.tax_spin,
+            self.slippage_spin,
+        )
+        self.contract_type_combo.currentTextChanged.connect(self._on_contract_type_changed)
+        for cost_spin in (self.commission_spin, self.tax_spin, self.slippage_spin):
+            cost_spin.valueChanged.connect(self._update_cost_hint)
+        self._on_contract_type_changed(self.contract_type_combo.currentText())
+        self._set_cost_controls_visible(False)
+        control_layout.addWidget(cost_group)
 
         order_group = QtWidgets.QGroupBox("下單  (台指近月 TXFR1)")
         order_layout = QtWidgets.QVBoxLayout(order_group)
@@ -173,14 +281,21 @@ class MainWindow(QtWidgets.QMainWindow):
         control_layout.addWidget(order_group)
 
         self.run_backtest_button = QtWidgets.QPushButton("執行回測")
+        self.optimize_filters_button = QtWidgets.QPushButton("自動最佳化限制")
+        self.apply_best_filter_button = QtWidgets.QPushButton("套用最佳限制")
         self.export_current_button = QtWidgets.QPushButton("匯出策略紀錄")
         self.export_backtest_button = QtWidgets.QPushButton("匯出回測結果")
         self.run_backtest_button.clicked.connect(self.run_backtest)
+        self.optimize_filters_button.clicked.connect(self.optimize_entry_filters)
+        self.apply_best_filter_button.clicked.connect(self.apply_best_entry_filter)
         self.export_current_button.clicked.connect(self.export_current_trades)
         self.export_backtest_button.clicked.connect(self.export_backtest_results)
+        self.apply_best_filter_button.setEnabled(False)
         self.export_current_button.setEnabled(False)
         self.export_backtest_button.setEnabled(False)
         control_layout.addWidget(self.run_backtest_button)
+        control_layout.addWidget(self.optimize_filters_button)
+        control_layout.addWidget(self.apply_best_filter_button)
         control_layout.addWidget(self.export_current_button)
         control_layout.addWidget(self.export_backtest_button)
 
@@ -208,8 +323,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         right_layout.addWidget(right_splitter, 1)
-        self.chart_widget = StrategyChartWidget()
-        right_splitter.addWidget(self.chart_widget)
+        chart_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.daily_chart_widget = StrategyChartWidget("日 K")
+        self.five_min_chart_widget = StrategyChartWidget("5 分 K")
+        self.chart_widget = self.five_min_chart_widget
+        self.daily_chart_widget.interval_requested.connect(
+            lambda interval: self._set_chart_interval("top", interval)
+        )
+        self.five_min_chart_widget.interval_requested.connect(
+            lambda interval: self._set_chart_interval("bottom", interval)
+        )
+        self._update_chart_interval_label()
+        chart_splitter.addWidget(self.daily_chart_widget)
+        chart_splitter.addWidget(self.five_min_chart_widget)
+        chart_splitter.setStretchFactor(0, 1)
+        chart_splitter.setStretchFactor(1, 2)
+        chart_splitter.setSizes([260, 540])
+        right_splitter.addWidget(chart_splitter)
 
         bottom_tabs = QtWidgets.QTabWidget()
         right_splitter.addWidget(bottom_tabs)
@@ -250,11 +380,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.backtest_metrics_label.setWordWrap(True)
         self.compare_table = QtWidgets.QTableWidget()
         self.compare_table.setAlternatingRowColors(True)
+        self.optimization_table = QtWidgets.QTableWidget()
+        self.optimization_table.setAlternatingRowColors(True)
+        self.period_analysis_table = QtWidgets.QTableWidget()
+        self.period_analysis_table.setAlternatingRowColors(True)
+        self.data_health_table = QtWidgets.QTableWidget()
+        self.data_health_table.setAlternatingRowColors(True)
         self.backtest_trade_table = QtWidgets.QTableWidget()
         self.backtest_trade_table.setAlternatingRowColors(True)
         backtest_layout.addWidget(self.backtest_metrics_label)
         backtest_layout.addWidget(QtWidgets.QLabel("1年 / 2年 對照"))
         backtest_layout.addWidget(self.compare_table)
+        backtest_layout.addWidget(QtWidgets.QLabel("最佳化限制 Top 10"))
+        backtest_layout.addWidget(self.optimization_table)
+        backtest_layout.addWidget(QtWidgets.QLabel("區間勝率 / 穩健性"))
+        backtest_layout.addWidget(self.period_analysis_table)
+        backtest_layout.addWidget(QtWidgets.QLabel("資料健康檢查"))
+        backtest_layout.addWidget(self.data_health_table)
         backtest_layout.addWidget(QtWidgets.QLabel("最近 20 筆回測交易"))
         backtest_layout.addWidget(self.backtest_trade_table)
         bottom_tabs.addTab(backtest_tab, "回測")
@@ -326,11 +468,79 @@ class MainWindow(QtWidgets.QMainWindow):
         self._position_timer.setInterval(10_000)
         self._position_timer.timeout.connect(self.refresh_positions)
 
+    def _set_advanced_controls_visible(self, visible):
+        for widget in getattr(self, "_advanced_controls", ()):
+            widget.setVisible(bool(visible))
+            label = self._advanced_form.labelForField(widget)
+            if label is not None:
+                label.setVisible(bool(visible))
+
+    def _set_cost_controls_visible(self, visible):
+        for widget in getattr(self, "_cost_detail_controls", ()):
+            widget.setVisible(bool(visible))
+            label = self._cost_form.labelForField(widget)
+            if label is not None:
+                label.setVisible(bool(visible))
+
+    def _on_contract_type_changed(self, contract_type):
+        preset = services.get_contract_cost_presets().get(contract_type)
+        if preset:
+            self.commission_spin.blockSignals(True)
+            self.tax_spin.blockSignals(True)
+            self.commission_spin.setValue(float(preset.get("commission_per_side", 0)))
+            self.tax_spin.setValue(float(preset.get("tax_per_side", 0)))
+            self.commission_spin.blockSignals(False)
+            self.tax_spin.blockSignals(False)
+        self._update_cost_hint()
+
+    def _current_point_value(self):
+        preset = services.get_contract_cost_presets().get(self.contract_type_combo.currentText(), {})
+        return float(preset.get("point_value", 50.0) or 50.0)
+
+    def _update_cost_hint(self):
+        point_value = self._current_point_value()
+        cash_cost = 2.0 * (float(self.commission_spin.value()) + float(self.tax_spin.value()))
+        slippage_points = 2.0 * float(self.slippage_spin.value())
+        total_points = cash_cost / point_value + slippage_points
+        self.cost_hint_label.setText(
+            f"{self.contract_type_combo.currentText()} 每筆進出約扣 {total_points:.1f} 點"
+        )
+
     def _sync_refresh_timer(self):
         if self.auto_refresh_checkbox.isChecked():
             self.refresh_timer.start(int(self.refresh_interval_spin.value() * 1000))
         else:
             self.refresh_timer.stop()
+
+    def _interval_label(self, interval):
+        return {
+            "5m": "5 分 K",
+            "30m": "30 分 K",
+            "60m": "60 分 K",
+            "1d": "日 K",
+        }.get(interval, str(interval))
+
+    def _update_chart_interval_label(self):
+        if hasattr(self, "chart_interval_label"):
+            self.chart_interval_label.setText(
+                f"上方：{self._interval_label(self.top_chart_interval)}　"
+                f"下方：{self._interval_label(self.bottom_chart_interval)}"
+            )
+        if hasattr(self, "daily_chart_widget"):
+            self.daily_chart_widget.set_title(self._interval_label(self.top_chart_interval))
+        if hasattr(self, "five_min_chart_widget"):
+            self.five_min_chart_widget.set_title(self._interval_label(self.bottom_chart_interval))
+
+    def _set_chart_interval(self, panel, interval):
+        if interval not in {"5m", "30m", "60m", "1d"}:
+            return
+        if panel == "top":
+            self.top_chart_interval = interval
+        else:
+            self.bottom_chart_interval = interval
+        self._update_chart_interval_label()
+        self._manual_refresh = True
+        self.refresh_data(silent=False)
 
     def _on_auto_refresh(self):
         self.refresh_data(silent=True)
@@ -345,7 +555,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._manual_refresh = True
 
         # 若已有資料，先立即重畫一次，讓使用者切換時就看到 Y 軸更新
-        if self.current_df is not None and not self.current_df.empty:
+        if self.bottom_chart_interval == "5m" and self.current_df is not None and not self.current_df.empty:
             self.chart_widget.update_chart(
                 self.current_df, trades=self.current_trades, reset_view=True
             )
@@ -357,6 +567,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.statusBar().showMessage("切換夜盤，重新載入資料並重算 Y 軸", 2500)
         self.refresh_data(silent=False)
+
+    def _on_strategy_changed(self):
+        strategy_key = self.strategy_combo.currentData()
+        if strategy_key != "masa_bottom_pullback":
+            return
+        changed = False
+        if self.interval_combo.currentText() != "5m":
+            self.interval_combo.setCurrentText("5m")
+            changed = True
+        if int(self.kbars_spin.value()) < 1500:
+            self.kbars_spin.setValue(1500)
+            changed = True
+        if changed:
+            self.statusBar().showMessage("麻紗底部拉回使用日K判斷、5分K進出，已切到5m並加載更多K棒", 5000)
 
     def open_login_dialog(self):
         dialog = LoginDialog(self)
@@ -376,11 +600,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("登入成功", 3000)
             # 確保登入後必定重設 Y 軸（即使 refresh 被 in-progress 擋住也有效）
             self._manual_refresh = True
-            if self.current_df is not None and not self.current_df.empty:
+            if self.bottom_chart_interval == "5m" and self.current_df is not None and not self.current_df.empty:
                 self.chart_widget.update_chart(
                     self.current_df, trades=self.current_trades, reset_view=True
                 )
             self.refresh_data()
+            self._start_data_backfill()
 
     def logout(self):
         self._position_timer.stop()
@@ -398,6 +623,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ticker_status_label.setText("未連線")
         self.account_info_label.setText("帳戶資訊：請先登入")
         self.statusBar().showMessage("已登出", 3000)
+
+    def _start_data_backfill(self):
+        if self.api is None:
+            return
+        self.statusBar().showMessage("登入成功，背景檢查近期 K 線缺口...", 5000)
+        self._run_worker(
+            services.backfill_missing_kbars_from_shioaji,
+            self._on_data_backfill_done,
+            self.api,
+            lookback_days=180,
+            silent=True,
+        )
+
+    def _on_data_backfill_done(self, result):
+        missing_count = len(result.get("missing_dates", []))
+        updated_rows = int(result.get("updated_rows", 0) or 0)
+        if updated_rows <= 0:
+            if missing_count:
+                self.statusBar().showMessage(
+                    f"資料缺口檢查完成：發現 {missing_count} 天缺資料，但 Shioaji 未回傳資料",
+                    6000,
+                )
+            else:
+                self.statusBar().showMessage("資料缺口檢查完成，近期資料完整", 4000)
+            return
+
+        self.statusBar().showMessage(
+            f"已補齊 {missing_count} 天缺口，共 {updated_rows:,} 筆，重新載入圖表...",
+            6000,
+        )
+        self._manual_refresh = False
+        QtCore.QTimer.singleShot(800, self._refresh_after_backfill)
+
+    def _refresh_after_backfill(self):
+        if self._refresh_in_progress:
+            QtCore.QTimer.singleShot(800, self._refresh_after_backfill)
+            return
+        self.refresh_data(silent=False)
 
     @QtCore.pyqtSlot(dict)
     def _on_tick_received(self, tick: dict):
@@ -420,12 +683,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def _selected_strategy_keys(self):
         return [self.strategy_combo.currentData()]
 
+    def _backtest_interval(self):
+        return "5m"
+
     def _risk_config(self):
-        return services.get_risk_config(
+        config = services.get_risk_config(
             self.stop_loss_quantile_spin.value(),
             self.profit_trigger_quantile_spin.value(),
             self.trailing_ratio_spin.value(),
+            min_ma60_slope_points=self.min_ma60_slope_spin.value(),
+            min_body_points=self.min_body_points_spin.value(),
+            min_body_atr_ratio=self.min_body_atr_ratio_spin.value(),
+            min_volume_ratio=self.min_volume_ratio_spin.value(),
+            entry_exclude_open_minutes=self.entry_exclude_open_spin.value(),
+            contract_type=self.contract_type_combo.currentText(),
+            point_value=self._current_point_value(),
+            commission_per_side=self.commission_spin.value(),
+            tax_per_side=self.tax_spin.value(),
+            slippage_points_per_side=self.slippage_spin.value(),
         )
+        if self._applied_optimization_risk_params is not None:
+            config["_active_risk_params"] = dict(self._applied_optimization_risk_params)
+        return config
+
+    def _clear_applied_optimization_risk(self):
+        self._applied_optimization_risk_params = None
 
     def _run_worker(self, func, on_success, *args, silent=False, **kwargs):
         worker = FunctionWorker(func, *args, **kwargs)
@@ -461,6 +743,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_busy(self, busy):
         self.refresh_button.setEnabled(not busy)
         self.run_backtest_button.setEnabled(not busy)
+        self.optimize_filters_button.setEnabled(not busy)
+        self.apply_best_filter_button.setEnabled((not busy) and bool(self.current_optimization_results))
         self.login_button.setEnabled(not busy and self.api is None)
         self.logout_button.setEnabled(not busy and self.api is not None)
 
@@ -471,20 +755,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_in_progress = True
         self._set_busy(True)
         self._run_worker(
-            services.load_display_data,
+            services.load_dashboard_data,
             self._on_data_loaded,
-            self.interval_combo.currentText(),
             self.session_combo.currentText(),
             int(self.kbars_spin.value()),
             api=self.api,
             auto_update=True,
+            top_interval=self.top_chart_interval,
+            bottom_interval=self.bottom_chart_interval,
             silent=silent,
         )
 
     def _on_data_loaded(self, result):
         self._set_busy(False)
         self._refresh_in_progress = False
-        self.current_df = result["df"]
+        self.current_df = result.get("df_5m", result["df"])
+        self.current_5m_df = self.current_df
+        self.current_daily_df = result.get("df_daily")
+        self.current_top_chart_df = result.get("df_top")
+        self.current_bottom_chart_df = result.get("df_bottom")
         meta = result["meta"]
         self.market_status_label.setText(f"市場：{meta['market_status']}")
         self.data_status_label.setText(f"來源：{meta['data_source']}　{meta['count']} 筆")
@@ -492,7 +781,11 @@ class MainWindow(QtWidgets.QMainWindow):
             f"DB 最新：{meta['last_db_ts']}　即時：{'是' if meta['is_realtime'] else '否'}"
         )
         self.statusBar().showMessage("資料已更新", 3000)
-        self.chart_widget.update_chart(self.current_df, trades=[], reset_view=self._manual_refresh)
+        if self.current_top_chart_df is not None and not self.current_top_chart_df.empty:
+            self.daily_chart_widget.update_chart(self.current_top_chart_df, trades=[], reset_view=self._manual_refresh)
+        bottom_trades = self.current_trades if self.bottom_chart_interval == "5m" else []
+        if self.current_bottom_chart_df is not None and not self.current_bottom_chart_df.empty:
+            self.five_min_chart_widget.update_chart(self.current_bottom_chart_df, trades=bottom_trades, reset_view=self._manual_refresh)
         self._update_strategy_views(meta["is_realtime"])
 
     def _update_strategy_views(self, is_realtime):
@@ -531,7 +824,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_trades = bundle["trades"]
         metrics_text = self._format_metrics_html("策略訊號統計", bundle["metrics"])
         self.export_current_button.setEnabled(bool(bundle["trades"]))
-        self.chart_widget.update_chart(self.current_df, trades=bundle["trades"], reset_view=self._manual_refresh)
+        if self.bottom_chart_interval == "5m":
+            self.five_min_chart_widget.update_chart(
+                self.current_df,
+                trades=bundle["trades"],
+                reset_view=self._manual_refresh,
+            )
+        elif self.current_bottom_chart_df is not None and not self.current_bottom_chart_df.empty:
+            self.five_min_chart_widget.update_chart(
+                self.current_bottom_chart_df,
+                trades=[],
+                reset_view=self._manual_refresh,
+            )
         self._manual_refresh = False
         self.current_metrics_label.setText(metrics_text)
         self._set_table_dataframe(self.current_trade_table, bundle["trade_df"])
@@ -545,21 +849,78 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_worker(
             services.run_backtest_bundle,
             self._on_backtest_done,
-            self.interval_combo.currentText(),
+            self._backtest_interval(),
             self.session_combo.currentText(),
             strategy_keys=self._selected_strategy_keys(),
             risk_config=self._risk_config(),
             period_days=period_days,
         )
 
+    def optimize_entry_filters(self):
+        self._set_busy(True)
+        self.current_optimization_results = []
+        self.apply_best_filter_button.setEnabled(False)
+        period_label = self.backtest_period_combo.currentText()
+        period_days = services.AUTO_BACKTEST_PERIOD_OPTIONS[period_label]
+        self._start_progress("最佳化限制中", maximum=0)
+        self._run_worker(
+            services.run_entry_filter_optimization_bundle,
+            self._on_optimization_done,
+            self._backtest_interval(),
+            self.session_combo.currentText(),
+            strategy_keys=self._selected_strategy_keys(),
+            base_risk_config=self._risk_config(),
+            period_days=period_days,
+            top_n=10,
+        )
+
+    def _on_optimization_done(self, result):
+        self._set_busy(False)
+        self.current_optimization_results = result.get("results", [])
+        self._set_table_dataframe(self.optimization_table, result.get("result_df"))
+        self.apply_best_filter_button.setEnabled(bool(self.current_optimization_results))
+        self.statusBar().showMessage(
+            f"最佳化完成：測試 {result['tested_count']}/{result['total_count']} 組，合格 {result['qualified_count']} 組",
+            5000,
+        )
+
+    def apply_best_entry_filter(self):
+        if not self.current_optimization_results:
+            return
+        best_config = self.current_optimization_results[0]["risk_config"]
+        self.min_ma60_slope_spin.setValue(float(best_config.get("min_ma60_slope_points", 0)))
+        self.min_body_points_spin.setValue(float(best_config.get("min_body_points", 0)))
+        self.min_body_atr_ratio_spin.setValue(float(best_config.get("min_body_atr_ratio", 0)))
+        self.min_volume_ratio_spin.setValue(float(best_config.get("min_volume_ratio", 0)))
+        self.entry_exclude_open_spin.setValue(int(best_config.get("entry_exclude_open_minutes", 0)))
+        self._applied_optimization_risk_params = best_config.get("_active_risk_params")
+        self.statusBar().showMessage("已套用最佳限制，可重新執行回測確認", 5000)
+        if self.current_df is not None and not self.current_df.empty:
+            self._update_strategy_views(False)
+
     def _on_backtest_done(self, result):
         self._set_busy(False)
+        self.current_backtest_result = result
         self.current_backtest_trades = result["trades"]
         self.current_backtest_df = result.get("df")
+        health = result.get("data_health_summary", {})
+        health_text = ""
+        if health:
+            health_text = (
+                f"　資料完整率：{health.get('completeness', 0):.1f}%"
+                f"　異常日：{health.get('problem_days', 0)}"
+            )
         self.backtest_metrics_label.setText(
-            self._format_metrics_html(f"回測（{result['period_days']}天）", result["metrics"])
+            self._format_metrics_html(f"回測（{result['period_days']}天）", result["metrics"]) + health_text
         )
         self._set_table_dataframe(self.compare_table, result.get("compare_df"))
+        self._set_table_dataframe(self.period_analysis_table, result.get("period_analysis_df"))
+        health_df = result.get("data_health_df")
+        if health_df is not None and not health_df.empty:
+            health_df = health_df[health_df["狀態"] != "OK"].head(50).reset_index(drop=True)
+            if health_df.empty:
+                health_df = result.get("data_health_df").head(10).reset_index(drop=True)
+        self._set_table_dataframe(self.data_health_table, health_df)
         recent_df = result.get("trade_df")
         if recent_df is not None and not recent_df.empty:
             recent_df = recent_df.tail(20).reset_index(drop=True)
@@ -666,13 +1027,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def export_current_trades(self):
         if not self.current_trades:
             return
-        out_dir, trade_csv, summary_csv, image_dir = services.export_backtest_results_to_folder(
+        out_dir, trade_csv, summary_csv, image_dir, report_path = services.export_backtest_results_to_folder(
             self.current_trades,
-            interval=self.interval_combo.currentText(),
+            interval=self._backtest_interval(),
             session=self.session_combo.currentText(),
             period_label="目前視窗",
             selected_strategy_keys=self._selected_strategy_keys(),
             backtest_df=self.current_df,
+            period_analysis_df=services.build_period_analysis_dataframe(self.current_trades),
         )
         image_dir, image_count = self._export_trade_images_from_chart(
             trades=self.current_trades,
@@ -681,21 +1043,32 @@ class MainWindow(QtWidgets.QMainWindow):
             trade_csv_path=trade_csv,
             title_prefix="目前視窗",
         )
+        _, masa_image_count = services.export_masa_bottom_pullback_entry_screenshots(
+            self.current_trades,
+            self.current_df,
+            out_dir,
+            trade_csv,
+        )
+        image_count += masa_image_count
         QtWidgets.QMessageBox.information(
             self, "匯出完成",
-            f"資料夾：{out_dir}\n明細：{trade_csv}\n摘要：{summary_csv}\n截圖：{image_dir}\n張數：{image_count}",
+            f"資料夾：{out_dir}\n報告：{report_path}\n明細：{trade_csv}\n摘要：{summary_csv}\n截圖：{image_dir}\n張數：{image_count}",
         )
 
     def export_backtest_results(self):
         if not self.current_backtest_trades:
             return
-        out_dir, trade_csv, summary_csv, image_dir = services.export_backtest_results_to_folder(
+        result = self.current_backtest_result or {}
+        out_dir, trade_csv, summary_csv, image_dir, report_path = services.export_backtest_results_to_folder(
             self.current_backtest_trades,
-            interval=self.interval_combo.currentText(),
+            interval=self._backtest_interval(),
             session=self.session_combo.currentText(),
             period_label=self.backtest_period_combo.currentText(),
             selected_strategy_keys=self._selected_strategy_keys(),
             backtest_df=self.current_backtest_df,
+            period_analysis_df=result.get("period_analysis_df"),
+            data_health_df=result.get("data_health_df"),
+            data_health_summary=result.get("data_health_summary"),
         )
         image_dir, image_count = self._export_trade_images_from_chart(
             trades=self.current_backtest_trades,
@@ -704,9 +1077,16 @@ class MainWindow(QtWidgets.QMainWindow):
             trade_csv_path=trade_csv,
             title_prefix=f"回測-{self.backtest_period_combo.currentText()}",
         )
+        _, masa_image_count = services.export_masa_bottom_pullback_entry_screenshots(
+            self.current_backtest_trades,
+            self.current_backtest_df,
+            out_dir,
+            trade_csv,
+        )
+        image_count += masa_image_count
         QtWidgets.QMessageBox.information(
             self, "匯出完成",
-            f"資料夾：{out_dir}\n明細：{trade_csv}\n摘要：{summary_csv}\n截圖：{image_dir}\n張數：{image_count}",
+            f"資料夾：{out_dir}\n報告：{report_path}\n明細：{trade_csv}\n摘要：{summary_csv}\n截圖：{image_dir}\n張數：{image_count}",
         )
 
     def _export_trade_images_from_chart(self, trades, source_df, out_dir, trade_csv_path, title_prefix):
