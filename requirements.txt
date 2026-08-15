@@ -1,11 +1,7 @@
-yfinance>=0.2.31
-mplfinance>=0.12.10b0
 pandas>=2.0.0
 matplotlib>=3.7.0
 shioaji[speed]>=1.0.0
-pathlib>=1.0.1
-streamlit>=1.28.0
-plotly>=5.17.0
 holidays>=0.40
+pytz>=2024.1
 PyQt5>=5.15.11
 pyqtgraph>=0.13.7

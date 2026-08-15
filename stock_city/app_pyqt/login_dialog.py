@@ -15,6 +15,8 @@ from stock_city.app_pyqt.workers import FunctionWorker
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 _SECRETS_PATH = _PROJECT_ROOT / ".streamlit" / "secrets.toml"
 _DEFAULT_CERT_PATH = _PROJECT_ROOT / "Sinopac.pfx"
+_SETTINGS_ORG = "Hiddleston"
+_SETTINGS_APP = "StickStrategy"
 
 
 def _load_secrets() -> dict:
@@ -33,6 +35,7 @@ class LoginDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.api = None
         self._worker = None
+        self._pending_login = {}
         self.setWindowTitle("Shioaji 登入")
         self.resize(500, 320)
         self._secrets = _load_secrets()
@@ -41,17 +44,24 @@ class LoginDialog(QtWidgets.QDialog):
 
     # ─── 自動帶入憑證 ────────────────────────────────────────────
     def _autofill(self):
-        """從 secrets.toml → 環境變數，依序嘗試帶入。"""
+        """從 secrets.toml、環境變數、上次成功登入設定依序嘗試帶入。"""
+        settings = QtCore.QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         api_key = (
             self._secrets.get("SHIOAJI_API_KEY")
             or self._secrets.get("shioaji", {}).get("api_key")
             or os.getenv("SHIOAJI_API_KEY", "")
+            or settings.value("shioaji/api_key", "")
         )
         secret_key = (
             self._secrets.get("SHIOAJI_SECRET_KEY")
             or self._secrets.get("shioaji", {}).get("secret_key")
             or os.getenv("SHIOAJI_SECRET_KEY", "")
+            or settings.value("shioaji/secret_key", "")
         )
+        person_id = settings.value("shioaji/person_id", "")
+        cert_path = settings.value("shioaji/cert_path", "")
+        cert_password = settings.value("shioaji/cert_password", "")
+        saved_mode = settings.value("shioaji/mode", "apikey")
 
         hints = []
         if api_key:
@@ -64,9 +74,18 @@ class LoginDialog(QtWidgets.QDialog):
             self.mode_radio_apikey.setChecked(True)
 
         # 若找到 Sinopac.pfx 則自動帶入憑證路徑
-        if _DEFAULT_CERT_PATH.exists():
+        if person_id:
+            self.person_id_edit.setText(person_id)
+        if cert_path:
+            self.cert_path_edit.setText(cert_path)
+        elif _DEFAULT_CERT_PATH.exists():
             self.cert_path_edit.setText(str(_DEFAULT_CERT_PATH))
             hints.append(f"已偵測到 {_DEFAULT_CERT_PATH.name}")
+        if cert_password:
+            self.cert_password_edit.setText(cert_password)
+        if saved_mode == "cert" and (person_id or cert_password):
+            self.mode_radio_cert.setChecked(True)
+            hints.append("憑證登入資料已自動帶入")
 
         if hints:
             self.status_label.setText("💡 " + "　" + "、".join(hints) + "，直接按「登入」即可。")
@@ -182,6 +201,14 @@ class LoginDialog(QtWidgets.QDialog):
                 return
             cert_path = None
             cert_password = None
+            self._pending_login = {
+                "mode": "apikey",
+                "api_key": api_key,
+                "secret_key": secret_key,
+                "person_id": "",
+                "cert_path": "",
+                "cert_password": "",
+            }
         else:
             # 憑證模式
             api_key = self.person_id_edit.text().strip() or None
@@ -197,6 +224,14 @@ class LoginDialog(QtWidgets.QDialog):
             if not cert_password:
                 self.status_label.setText("請輸入憑證密碼。")
                 return
+            self._pending_login = {
+                "mode": "cert",
+                "api_key": "",
+                "secret_key": "",
+                "person_id": api_key,
+                "cert_path": cert_path,
+                "cert_password": cert_password,
+            }
 
         self.status_label.setText("登入中，請稍候…")
         self.login_button.setEnabled(False)
@@ -220,9 +255,22 @@ class LoginDialog(QtWidgets.QDialog):
             self.status_label.setText(f"登入失敗：{error}")
             return
         self.api = api
+        self._save_login_defaults()
         self.accept()
 
     @QtCore.pyqtSlot(str)
     def _on_login_error(self, message):
         self.login_button.setEnabled(True)
         self.status_label.setText(f"登入失敗：{message}")
+
+    def _save_login_defaults(self):
+        if not self._pending_login:
+            return
+        settings = QtCore.QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        settings.setValue("shioaji/mode", self._pending_login.get("mode", "apikey"))
+        settings.setValue("shioaji/api_key", self._pending_login.get("api_key", ""))
+        settings.setValue("shioaji/secret_key", self._pending_login.get("secret_key", ""))
+        settings.setValue("shioaji/person_id", self._pending_login.get("person_id", ""))
+        settings.setValue("shioaji/cert_path", self._pending_login.get("cert_path", ""))
+        settings.setValue("shioaji/cert_password", self._pending_login.get("cert_password", ""))
+        settings.sync()

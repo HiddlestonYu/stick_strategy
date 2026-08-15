@@ -257,6 +257,7 @@ class StrategyChartWidget(QtWidgets.QWidget):
         if hasattr(event, "button") and event.button() == QtCore.Qt.RightButton:
             menu = QtWidgets.QMenu(self)
             for label, interval in (
+                ("1 分 K", "1m"),
                 ("5 分 K", "5m"),
                 ("30 分 K", "30m"),
                 ("60 分 K", "60m"),

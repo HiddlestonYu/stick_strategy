@@ -361,16 +361,16 @@ def resample_ticks_to_kbars(ticks_df, interval='1d', session='全盤'):
         grouped.index.name = 'ts'
         return grouped.sort_index()
 
-    # 夜盤日K：以「交易日」彙總（夜盤 15:00 起算歸屬隔日），避免被午夜切成兩根
+    # 夜盤日K：以夜盤開盤日彙總（15:00~隔日05:00 標示為開盤日），對齊元大 TXFPM 日K。
     if interval == '1d' and session == '夜盤':
         df = ticks_df.copy()
         idx = df.index
 
-        # 交易日歸屬：15:00~23:59 歸「隔日」；00:00~14:59 歸「當日」
+        # 夜盤日期歸屬：15:00~23:59 歸「當日」；00:00~05:00 歸「前一日」。
         # 注意：這裡的 df 已經在前面依夜盤時段過濾過（15:00~05:00，含 05:00 這一根）。
         hours = idx.hour
         trade_date = pd.Series(idx.date, index=df.index)
-        trade_date = trade_date.where(hours < 15, (idx + pd.Timedelta(days=1)).date)
+        trade_date = trade_date.where(hours >= 15, (idx - pd.Timedelta(days=1)).date)
         session_day = pd.to_datetime(trade_date).dt.tz_localize('Asia/Taipei')
 
         grouped = df.groupby(session_day).agg({

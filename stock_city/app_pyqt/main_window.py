@@ -36,6 +36,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_in_progress = False
         self._manual_refresh = True
         self._strategy_worker = None
+        self.backtest_dialog = None
         self._last_price = None
         self._tick_bridge = TickSignalBridge()
         self._tick_bridge.tick_received.connect(self._on_tick_received)
@@ -105,7 +106,7 @@ class MainWindow(QtWidgets.QMainWindow):
         strategy_form = QtWidgets.QFormLayout(strategy_group)
         strategy_form.setSpacing(6)
         self.enable_strategy_checkbox = QtWidgets.QCheckBox("啟用策略訊號")
-        self.enable_strategy_checkbox.setChecked(True)
+        self.enable_strategy_checkbox.setChecked(False)
         self.strategy_combo = QtWidgets.QComboBox()
         for key, name in services.get_strategy_options().items():
             self.strategy_combo.addItem(name, key)
@@ -160,7 +161,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_advanced_checkbox.setChecked(False)
         self.show_advanced_checkbox.toggled.connect(self._set_advanced_controls_visible)
         strategy_form.addRow(self.show_advanced_checkbox)
-        control_layout.addWidget(strategy_group)
+        self.strategy_group = strategy_group
         self._advanced_controls = (
             self.stop_loss_quantile_spin,
             self.profit_trigger_quantile_spin,
@@ -293,11 +294,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_best_filter_button.setEnabled(False)
         self.export_current_button.setEnabled(False)
         self.export_backtest_button.setEnabled(False)
-        control_layout.addWidget(self.run_backtest_button)
-        control_layout.addWidget(self.optimize_filters_button)
-        control_layout.addWidget(self.apply_best_filter_button)
-        control_layout.addWidget(self.export_current_button)
-        control_layout.addWidget(self.export_backtest_button)
+        self.open_backtest_dialog_button = QtWidgets.QPushButton("策略回測")
+        self.open_backtest_dialog_button.clicked.connect(self.open_backtest_dialog)
+        control_layout.addWidget(self.open_backtest_dialog_button)
 
         status_group = QtWidgets.QGroupBox("連線 / 資料狀態")
         status_layout = QtWidgets.QVBoxLayout(status_group)
@@ -321,8 +320,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_layout.addWidget(self._build_price_ticker())
 
-        right_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        right_layout.addWidget(right_splitter, 1)
         chart_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.daily_chart_widget = StrategyChartWidget("日 K")
         self.five_min_chart_widget = StrategyChartWidget("5 分 K")
@@ -337,15 +334,28 @@ class MainWindow(QtWidgets.QMainWindow):
         chart_splitter.addWidget(self.daily_chart_widget)
         chart_splitter.addWidget(self.five_min_chart_widget)
         chart_splitter.setStretchFactor(0, 1)
-        chart_splitter.setStretchFactor(1, 2)
-        chart_splitter.setSizes([260, 540])
-        right_splitter.addWidget(chart_splitter)
+        chart_splitter.setStretchFactor(1, 1)
+        chart_splitter.setSizes([460, 460])
+        right_layout.addWidget(chart_splitter, 1)
+
+        self.backtest_dialog = QtWidgets.QDialog(self)
+        self.backtest_dialog.setWindowTitle("策略回測")
+        self.backtest_dialog.resize(1280, 860)
+        backtest_dialog_layout = QtWidgets.QVBoxLayout(self.backtest_dialog)
+        backtest_dialog_layout.setContentsMargins(8, 8, 8, 8)
+        backtest_dialog_layout.setSpacing(8)
+        backtest_dialog_layout.addWidget(self.strategy_group)
+
+        backtest_button_row = QtWidgets.QHBoxLayout()
+        backtest_button_row.addWidget(self.run_backtest_button)
+        backtest_button_row.addWidget(self.optimize_filters_button)
+        backtest_button_row.addWidget(self.apply_best_filter_button)
+        backtest_button_row.addWidget(self.export_current_button)
+        backtest_button_row.addWidget(self.export_backtest_button)
+        backtest_dialog_layout.addLayout(backtest_button_row)
 
         bottom_tabs = QtWidgets.QTabWidget()
-        right_splitter.addWidget(bottom_tabs)
-        right_splitter.setStretchFactor(0, 4)
-        right_splitter.setStretchFactor(1, 1)
-        right_splitter.setSizes([800, 200])
+        backtest_dialog_layout.addWidget(bottom_tabs, 1)
 
         trade_tab = QtWidgets.QWidget()
         trade_layout = QtWidgets.QVBoxLayout(trade_tab)
@@ -514,6 +524,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _interval_label(self, interval):
         return {
+            "1m": "1 分 K",
             "5m": "5 分 K",
             "30m": "30 分 K",
             "60m": "60 分 K",
@@ -532,7 +543,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.five_min_chart_widget.set_title(self._interval_label(self.bottom_chart_interval))
 
     def _set_chart_interval(self, panel, interval):
-        if interval not in {"5m", "30m", "60m", "1d"}:
+        if interval not in {"1m", "5m", "30m", "60m", "1d"}:
             return
         if panel == "top":
             self.top_chart_interval = interval
@@ -581,6 +592,13 @@ class MainWindow(QtWidgets.QMainWindow):
             changed = True
         if changed:
             self.statusBar().showMessage("麻紗底部拉回使用日K判斷、5分K進出，已切到5m並加載更多K棒", 5000)
+
+    def open_backtest_dialog(self):
+        if self.backtest_dialog is None:
+            return
+        self.backtest_dialog.show()
+        self.backtest_dialog.raise_()
+        self.backtest_dialog.activateWindow()
 
     def open_login_dialog(self):
         dialog = LoginDialog(self)
@@ -745,6 +763,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_backtest_button.setEnabled(not busy)
         self.optimize_filters_button.setEnabled(not busy)
         self.apply_best_filter_button.setEnabled((not busy) and bool(self.current_optimization_results))
+        if hasattr(self, "open_backtest_dialog_button"):
+            self.open_backtest_dialog_button.setEnabled(not busy)
         self.login_button.setEnabled(not busy and self.api is None)
         self.logout_button.setEnabled(not busy and self.api is not None)
 

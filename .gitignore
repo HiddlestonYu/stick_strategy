@@ -15,15 +15,10 @@ trading_env/
 env/
 ENV/
 
-# Streamlit
-.streamlit/*
-!.streamlit/secrets.toml.example
-
-# Secrets
-.streamlit/secrets.toml
-
 # IDE
-.vscode/
+.vscode/*
+!.vscode/
+!.vscode/tasks.json
 .idea/
 *.swp
 *.swo
@@ -43,6 +38,14 @@ test_*.py
 # Logs
 *.log
 
+# Local secrets
+.streamlit/*
+!.streamlit/
+!.streamlit/secrets.toml.example
+
+# Local Codex/app workspace
+.agents/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
@@ -50,6 +53,7 @@ test_*.py
 *.csv
 *.xlsx
 *.json
+!.vscode/tasks.json
 
 # Backtest outputs
 backtest_outputs/

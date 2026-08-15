@@ -69,6 +69,17 @@ def login_shioaji(api_key=None, secret_key=None, cert_path=None, cert_password=N
         msg = str(message or "")
         return ("Too Many Connections" in msg) or ("連線數過多" in msg)
 
+    def _format_login_error(status_code, detail) -> str:
+        detail_text = str(detail or "")
+        hints = []
+        if "not exist" in detail_text.lower() or "key:" in detail_text.lower():
+            hints.append("API Key 不存在、未啟用，或不是永豐 API 後台目前有效的 key")
+        if "ip_address" in detail_text.lower() or "ip address" in detail_text.lower():
+            hints.append("目前外部 IP 可能未加入永豐 API 白名單")
+        if status_code == 400 and hints:
+            return "登入失敗：永豐 API 拒絕登入。" + "；".join(hints) + "。請到永豐 API 後台確認 API Key/Secret 與 IP 白名單。"
+        return f"登入失敗：狀態碼 {status_code}，詳情：{detail_text}"
+
     max_attempts = 2
     last_error = None
 
@@ -97,7 +108,7 @@ def login_shioaji(api_key=None, secret_key=None, cert_path=None, cert_password=N
                     if status_code == 200:
                         return api, None
                     detail = result.get("response", {}).get("detail", "未知錯誤")
-                    error_msg = f"狀態碼: {status_code}, 詳情: {detail}"
+                    error_msg = _format_login_error(status_code, detail)
                     last_error = error_msg
                     if _is_too_many_connections(error_msg) and attempt < max_attempts:
                         time.sleep(2)
@@ -476,6 +487,8 @@ def _chart_kbar_count(interval, requested_count):
         return max(300, min(2000, int(requested_count)))
     if interval == "30m":
         return max(500, min(2500, int(requested_count)))
+    if interval == "1m":
+        return max(1500, min(5000, int(requested_count) * 2))
     return max(1000, min(3000, int(requested_count)))
 
 

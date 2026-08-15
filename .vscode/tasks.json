@@ -1,0 +1,39 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run PyQt App",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "${workspaceFolder}\\pyqt_run_app.py"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Compile Check",
+      "type": "process",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "py_compile",
+        "${workspaceFolder}\\pyqt_run_app.py",
+        "${workspaceFolder}\\stock_city\\app_pyqt\\main_window.py",
+        "${workspaceFolder}\\stock_city\\app_pyqt\\services.py",
+        "${workspaceFolder}\\stock_city\\app_pyqt\\chart_widget.py",
+        "${workspaceFolder}\\stock_city\\strategy\\ma20_ma60.py"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
